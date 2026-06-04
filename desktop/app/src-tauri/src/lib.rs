@@ -677,6 +677,10 @@ async fn stop_pick_mode(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Monotonic counter for pick-time crop filenames (`pick-crop-<pid>-<seq>.png`).
+/// The unique seq also serves as a per-pick identity for the auto-trigger watcher.
+static PICK_CROP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[tauri::command]
 async fn overlay_click(
     app: AppHandle,
@@ -859,8 +863,84 @@ async fn overlay_click(
         };
     }
 
+    // Capture the element's pixels NOW, while the target app is frontmost (the
+    // user just clicked it). We grab the owning window by its CG id via
+    // `screencapture -l` and crop to the (final) element bounds — immune to our
+    // pick overlay's highlight border AND to later occlusion, so `get_selection`
+    // can hand `/replicate-ui` the real pixels even after the app is closed.
+    // Strictly best-effort: any failure leaves `crop_path = None` and never
+    // blocks the pick.
+    //
+    // SKIP for shallow (Electron) picks: there `bounds` is a click-centered
+    // placeholder box (set above), NOT the real element, so a crop of it would be
+    // a meaningless slice. Leaving crop_path = None is exactly the signal
+    // /replicate-ui uses to re-resolve via extract_component at the click point.
+    //
+    // NOTE: the capture (screencapture + decode + crop) is awaited inline, so a
+    // successful capture adds ~150-300ms before the highlight updates. Acceptable
+    // for now; could be detached + back-filled if pick latency becomes an issue.
+    if !picked.ax_shallow {
+        let elem = picked.bounds;
+        let pid = picked.pid;
+        // Owning window: prefer a normal-layer (0) window that contains the
+        // element; then ANY-layer window that contains it (open menus, combobox
+        // dropdowns, popovers, sheets live on layer > 0 — without this they'd be
+        // mis-attributed to the main window and cropped at the wrong coords);
+        // then the first normal-layer / any window for this pid.
+        let target_win = {
+            let wins = vibe_extract_core::windows_list::list_windows();
+            let center = elem.center();
+            wins.iter()
+                .filter(|w| w.pid == pid && w.layer == 0)
+                .find(|w| w.bounds.contains(center))
+                .or_else(|| wins.iter().filter(|w| w.pid == pid).find(|w| w.bounds.contains(center)))
+                .or_else(|| wins.iter().find(|w| w.pid == pid && w.layer == 0))
+                .or_else(|| wins.iter().find(|w| w.pid == pid))
+                .map(|w| (w.window_id, w.bounds))
+        };
+        if let Some((window_id, win_bounds)) = target_win {
+            let dir = app.state::<OutputDir>().inner().0.clone();
+            let _ = std::fs::create_dir_all(&dir);
+            let seq = PICK_CROP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Wall-clock millis in the name so a crop_path is unique even across a
+            // binary restart (the seq resets to 0 each launch, and the target pid
+            // can recur — without this a post-restart first pick could collide
+            // with a pre-restart filename and confuse the watcher's new-pick check).
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let out = dir.join(format!("pick-crop-{}-{}-{}.png", pid, stamp, seq));
+            let out_for_task = out.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                vibe_extract_core::screenshot::capture_window_crop(
+                    window_id, win_bounds, elem, &out_for_task,
+                )
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => {
+                    log::info!("overlay_click: saved pick-time crop {}", out.display());
+                    picked.crop_path = Some(out.to_string_lossy().into_owned());
+                }
+                Ok(Err(e)) => log::warn!("overlay_click: pick-time crop failed: {}", e),
+                Err(e) => log::warn!("overlay_click: crop task join error: {}", e),
+            }
+        } else {
+            log::warn!(
+                "overlay_click: no window found for pid {} — skipping pick-time crop",
+                pid
+            );
+        }
+    } else {
+        log::info!("overlay_click: shallow pick — leaving crop_path None (re-resolve via CDP)");
+    }
+
     // Same-app constraint when shift-clicking.
     let state = app.state::<PickSessionState>();
+    // Crop files of a selection we're about to discard (fresh non-shift pick),
+    // so the output dir doesn't accumulate orphaned pick-crop PNGs over a session.
+    let mut dropped_crops: Vec<String> = Vec::new();
     let new_selected_list = {
         let mut s = state.0.lock().unwrap();
         if !s.active {
@@ -880,12 +960,17 @@ async fn overlay_click(
                 s.locked_pid = Some(picked.pid);
             }
         } else {
+            dropped_crops.extend(s.selected.iter().filter_map(|e| e.crop_path.clone()));
             s.selected.clear();
             s.selected.push(picked.clone());
             s.locked_pid = Some(picked.pid);
         }
         s.selected.clone()
     };
+    // Best-effort GC of the superseded selection's crops (outside the lock).
+    for p in dropped_crops {
+        let _ = std::fs::remove_file(p);
+    }
 
     // Persist the current selection so the MCP `get_selection` tool — and thus
     // `/replicate-ui` — can read exactly what the user picked. Written on every
@@ -1518,6 +1603,7 @@ async fn walk_hover_ancestry(app: AppHandle, go_up: bool) -> Result<(), String> 
                 // Deliberate ↑ ancestry walk — preserve the anchor, not shallow.
                 click: current.click,
                 ax_shallow: false,
+                crop_path: None,
             }
         } else {
             // Walk DOWN: find the deepest descendant under the cursor (or the
@@ -1564,6 +1650,7 @@ async fn walk_hover_ancestry(app: AppHandle, go_up: bool) -> Result<(), String> 
                 // Deliberate ↓ ancestry walk — preserve the anchor, not shallow.
                 click: current.click,
                 ax_shallow: false,
+                crop_path: None,
             }
         }
     };
@@ -1701,6 +1788,7 @@ fn spawn_hover_task(app: AppHandle) {
                                         window_bounds: Some(win),
                                         click: Some(pt),
                                         ax_shallow: false,
+                                        crop_path: None,
                                     });
                                     last_box = Some(bounds);
                                     if let Some(overlay) = app.get_webview_window("overlay") {
@@ -1845,6 +1933,7 @@ fn spawn_hover_task(app: AppHandle) {
                                         window_bounds,
                                         click: Some(pt),
                                         ax_shallow,
+                                        crop_path: None,
                                     });
                                 }
                                 (needs, ())

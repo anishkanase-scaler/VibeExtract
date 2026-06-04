@@ -106,6 +106,103 @@ pub fn capture_window_b64(win: &crate::windows_list::WindowInfo) -> Result<ShotR
     capture_region_b64(win.bounds)
 }
 
+/// Capture ONLY the target window (by its CG `window_id`) and crop to `elem`,
+/// saving the cropped PNG to `out_path`.
+///
+/// Uses `screencapture -l <id>`, which reads that window's backing store and
+/// ignores anything composited above it — so the result is immune both to
+/// occlusion (other windows on top, different Space) AND to our own pick-mode
+/// highlight overlay. That's why this is preferred over `-R` region capture at
+/// pick-time: a region grab would bake in the overlay's selection border.
+///
+/// `win` is the target window's bounds (points, top-left); `elem` is the element
+/// rect in the same screen/point space. The device→point `scale` is derived from
+/// the captured window pixels vs `win.w`, then used to map `elem` into the crop.
+#[cfg(target_os = "macos")]
+pub fn capture_window_crop(
+    window_id: u32,
+    win: ScreenRect,
+    elem: ScreenRect,
+    out_path: &Path,
+) -> Result<()> {
+    if !elem.is_valid() {
+        bail!("zero-sized element bounds: {:?}", elem);
+    }
+    if win.w <= 0.0 || win.h <= 0.0 {
+        bail!("invalid window bounds: {:?}", win);
+    }
+    let seq = SHOT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!(
+        "vibe-extract-winshot-{}-{}.png",
+        std::process::id(),
+        seq
+    ));
+    // `-x` silent, `-o` omit the window's drop shadow (so the PNG is exactly the
+    // window content at win.w×win.h points × scale), `-l <id>` that window only.
+    let status = std::process::Command::new("/usr/sbin/screencapture")
+        .args(["-x", "-o", "-l", &window_id.to_string()])
+        .arg(&tmp)
+        .status()
+        .context("invoking /usr/sbin/screencapture -l")?;
+    if !status.success() {
+        bail!("screencapture -l exited with status {:?}", status.code());
+    }
+    if !tmp.exists() {
+        bail!("screencapture -l didn't produce {}", tmp.display());
+    }
+    let img = image::open(&tmp).with_context(|| format!("decoding window shot {}", tmp.display()))?;
+    let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+    let (img_w, img_h) = (img.width(), img.height());
+    if img_w == 0 || img_h == 0 {
+        bail!("empty window capture for window_id={window_id}");
+    }
+    // Reject an element that doesn't meaningfully overlap the captured window.
+    // A mis-resolved owning window (wrong layer / fallback) or a stale bound would
+    // otherwise clamp into a 1px strip and be saved as if it were a valid crop —
+    // a silently-wrong reference is worse than None (the caller treats Err as
+    // best-effort and leaves crop_path unset). Intersect in point space.
+    let ox = elem.x.max(win.x);
+    let oy = elem.y.max(win.y);
+    let ox2 = (elem.x + elem.w).min(win.x + win.w);
+    let oy2 = (elem.y + elem.h).min(win.y + win.h);
+    if ox2 - ox < 1.0 || oy2 - oy < 1.0 {
+        bail!("element {:?} does not overlap window {:?}", elem, win);
+    }
+    // Per-axis device-pixels/point. On a single Retina display these are equal,
+    // but deriving both means an asymmetric shadow strip / backing-store vs CG
+    // bounds mismatch on one axis can't silently skew the other.
+    let scale_x = img_w as f64 / win.w;
+    let scale_y = img_h as f64 / win.h;
+    // Edge-based rounding: round the origin and the far edge independently, then
+    // take size = edge - origin. This keeps the right/bottom edge consistent with
+    // the rounded origin (avoids the ±1px drift of rounding origin and size
+    // separately) — matters for tight per-icon sprite crops.
+    let x0 = ((elem.x - win.x).max(0.0) * scale_x).round() as i64;
+    let y0 = ((elem.y - win.y).max(0.0) * scale_y).round() as i64;
+    let x1 = ((elem.x + elem.w - win.x).max(0.0) * scale_x).round() as i64;
+    let y1 = ((elem.y + elem.h - win.y).max(0.0) * scale_y).round() as i64;
+    let cx = x0.clamp(0, img_w as i64 - 1) as u32;
+    let cy = y0.clamp(0, img_h as i64 - 1) as u32;
+    let cw = ((x1 - x0).max(1) as u32).min(img_w - cx);
+    let ch = ((y1 - y0).max(1) as u32).min(img_h - cy);
+    let cropped = img.crop_imm(cx, cy, cw, ch);
+    cropped
+        .save(out_path)
+        .with_context(|| format!("writing crop {}", out_path.display()))?;
+    Ok(())
+}
+
+/// Non-macOS fallback: region capture (no window-id / overlay immunity).
+#[cfg(not(target_os = "macos"))]
+pub fn capture_window_crop(
+    _window_id: u32,
+    _win: ScreenRect,
+    elem: ScreenRect,
+    out_path: &Path,
+) -> Result<()> {
+    capture_region(elem, out_path)
+}
+
 /// Sample the on-screen color at a single point (top-left origin, points).
 /// Captures a tiny region around the point and returns its top-left pixel.
 pub fn sample_point(at: ScreenPoint) -> Result<(u8, u8, u8)> {

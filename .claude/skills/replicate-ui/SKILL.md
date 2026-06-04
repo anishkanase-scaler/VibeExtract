@@ -62,10 +62,21 @@ persist is the skill (with its `_shared/`).
    intended pick), switch to **COMPONENT-ONLY mode**: skip the whole-window inventory and replicate
    *just* the selected element(s). For each element, first decide whether to trust its `bounds`:
 
+   **Native reference crop — prefer `crop_path` (healthy picks only).** A *healthy* pick carries
+   `crop_path`: a PNG of that element captured AT PICK-TIME (cropped from the owning window, free of
+   the pick overlay). It stays valid even if the app has since been **closed or moved to another
+   Space**, so use it as the native reference (`compare_images` `a_path`) instead of a live
+   `screenshot_region` whenever it's non-null — no need to keep the target app on screen. Fall back to
+   `screenshot_region { x,y,w,h }=bounds` only when `crop_path` is null AND the app is still visible.
+   For **shallow picks `crop_path` is intentionally null** (the bounds were a click-centered placeholder,
+   not the real element) — don't treat that as a capture failure; re-resolve via `extract_component`
+   at the click as below (this needs the app still running).
+
    - **Healthy AX pick** (`ax_shallow` is false **and** role isn't AXMenuBar/AXApplication/AXWindow):
-     use its `bounds` (points, top-left) as the region — `ax_subtree_at_point { x: bounds.x+bounds.w/2,
-     y: bounds.y+bounds.h/2 }` for roles/structure, `screenshot_region { x,y,w,h }`=`bounds` for the
-     native reference, `extract_component { x, y }` for a DOM/CSS head-start.
+     use its `bounds` (points, top-left) for structure — `ax_subtree_at_point { x: bounds.x+bounds.w/2,
+     y: bounds.y+bounds.h/2 }` for roles/structure, the element's `crop_path` (else
+     `screenshot_region { x,y,w,h }`=`bounds`) for the native reference, `extract_component { x, y }`
+     for a DOM/CSS head-start.
    - **Shallow AX pick** (`ax_shallow` is true, or role ∈ {AXMenuBar, AXApplication, AXWindow}): the
      native AX tree couldn't see the real element — normal for **Electron** apps (Slack, VS Code),
      whose web content isn't exposed to AX. **Do NOT use `bounds`** (it's a click-centred placeholder,
@@ -79,23 +90,26 @@ persist is the skill (with its `_shared/`).
    (Multiple selected elements → compose them.) If `present` is false/empty, proceed with the
    **whole-window** flow below.
 
-2c. **Reuse check — similar page of an app you've done before?** Apps with many pages
-   (a 10-screen tool) share identical chrome, fonts, icons, and toolbar across pages — only
-   the content/layout differs. Before paying full cost, run
-   `python3 "<skill-base>/_shared/cache.py" <app> [win_w win_h]` (app = the working-dir name,
-   e.g. `slack`). It reports what's already cached and reusable:
-   - **assets** (`assets/manifest.json`) present → **REUSE verbatim**; SKIP
-     `relaunch_with_debug_port` + `extract_assets` entirely (the slowest, most disruptive step —
-     it quits the app). The icon set and fonts never change page-to-page.
-   - **grid labels** (`capture/headers_cache.json`) present for the same window size → reused by
-     `gridtext.py` automatically; no re-OCR.
-   - **prior replica** (`index.html`) present → **START FROM IT**: copy it to the new page's dir,
-     then diff-edit ONLY the regions that changed (new/removed controls, different text/state, new
-     layout) and re-verify just those — far fewer iterations than generating from scratch.
-   - **sprites** (`cache/sprites/`) — AX-app ribbon/toolbar icons are content-addressed
-     (`_shared/cache.py: SpriteCache`); identical icons reuse the same file across pages.
-   Reuse the stable parts; regenerate only what differs. (First page of an app → nothing cached →
-   full cost, as below. This is the incremental-reuse path: pay once per app, fast thereafter.)
+2c. **Reuse check — METHOD only, NEVER stale pixels.** 🚫 **THE GOLDEN RULE OF REUSE: the
+   CURRENT capture (for a selected component, the pick-time `crop_path`) is the SINGLE source of
+   truth for every pixel — colours AND sprites alike. NEVER reuse colours, sprite PNGs,
+   `window.png`, or a prior `index.html`'s pixels from an earlier run.** A previous capture can be
+   from a different theme/appearance/state — reusing its pixels silently ships the WRONG background
+   shade or a stale icon (e.g. a dark Share button, or a `#1b1b1b` fill where the live app is
+   `#282828`). The dev must never have to point at a wrong colour or icon. So every run **re-derives
+   all pixels from the fresh capture: re-sample EVERY colour and re-slice EVERY sprite from it.**
+   Run `python3 "<skill-base>/_shared/cache.py" <app> [win_w win_h]` (app = the working-dir name) to
+   see what's cached, but reuse is limited to the **METHOD**, not pixels:
+   - ✅ **REUSE — generator script** (`build.py`): the layout structure + per-element coordinate
+     map. Re-run it against the FRESH capture so it re-samples colours + re-slices sprites anew.
+   - ✅ **REUSE — text fonts** (`assets/fonts/*.woff2`): glyph files don't change page-to-page.
+   - ✅ **REUSE — grid-OCR labels** (`capture/headers_cache.json`) ONLY when the capture is
+     byte-identical (same mtime) — `gridtext.py` already guards on this.
+   - ❌ **DO NOT REUSE — colours / sprite PNGs / `window.png` / prior `index.html` pixels.**
+     Re-capture (or use the fresh crop) and regenerate these every run. `cache.py` reports these as
+     present for speed context, but they are a *stale-pixel trap* — re-derive, don't copy.
+   First page of an app → nothing cached → full cost. Thereafter you save the *method* (no
+   re-measuring layout, no re-OCR, no re-harvesting fonts) — but pixels are always fresh.
 
 3. **Inventory.** `ax_tree { pid, window_index: 0 }` → the component tree (roles,
    names, values, per-node `bounds`). This is your structural source of truth — a
@@ -110,8 +124,9 @@ persist is the skill (with its `_shared/`).
    them in the replica MUST come from a harvest (`extract_assets`) or the reuse cache — this is
    not optional and not something to defer or "fix later." Hand-drawn SVGs are the #1 cause of a
    replica that looks wrong; the user should never have to point one out. So:
-   - **Run `extract_assets { }` on every run** (skip only if step 2c already reported cached
-     assets — then reuse `assets/` + `manifest.json`).
+   - **Run `extract_assets { }` on every run** (it reads the LIVE renderer, so it's never stale).
+     Per step 2c, reuse only the cached **fonts** (`assets/fonts/*.woff2`) verbatim; re-derive
+     **icons/SVGs/images** from this run's harvest, not a prior run's pixels.
    - If the target is **Electron without a debug port**, *offer* `relaunch_with_debug_port` to
      enable the harvest — do **not** fall back to drawing.
    - For **native (AX) apps** (no CDP), icons come from per-element screenshot **sprites**
@@ -154,10 +169,17 @@ persist is the skill (with its `_shared/`).
 6. **Generate.** Write plain, self-contained **HTML+CSS** (no framework, no build
    step) to a working dir, sized to the component's **point** dimensions. Use the
    AX inventory for structure/text and the reference shot for colors, spacing, and fonts.
+   **🔑 Single pixel source:** sample EVERY colour and slice EVERY sprite from the **same current
+   capture you will diff against** — for a selected component that is the pick-time `crop_path`
+   (set the generator's source image to the crop *before* any sampling/slicing). NEVER read a
+   colour from a cached constant or an older capture; that's the `#1b1b1b→#282828` stale-bg trap.
+   If you reuse a prior generator (step 2c), confirm its `C_*` colour samples and sprite slices
+   read from THIS run's image, not the one baked at its last run.
    **Sample colors with `sample_color` at MULTIPLE points — don't assume one flat fill.**
    Backgrounds vary: a title-bar strip, a header band, and the body can be different shades
    (e.g. Slack's lighter title bar over a darker aubergine body) — sample each region; guessing
-   a single bg color is a common, visible miss.
+   a single bg color is a common, visible miss. **Sample the fill that shows in the GAPS between
+   icons too** (the container background) — that's the one that bit us as a too-dark ribbon.
    For **icons and images**, drop in the real assets from step 3b (inline the harvested SVGs /
    reference the saved PNGs + woff2). 🚫 **NEVER hand-draw an icon. If you find yourself about to
    write an SVG path from scratch, STOP and harvest or crop the real one** (step 3b's exact-icon
@@ -219,12 +241,20 @@ persist is the skill (with its `_shared/`).
    Read `score` (0..1) and look at the returned **diff heatmap** (bright red = where
    they differ).
 
-9. **Iterate.** If `pass` is false (score < 0.92): inspect the heatmap, fix the
-   HTML/CSS for the highlighted regions, re-render, re-diff. Stop when:
+9. **Iterate — YOURSELF, to the bar. The dev picks once and never iterates.** If `pass` is false
+   (score < 0.92): inspect the heatmap, fix the HTML/CSS for the highlighted regions, re-render,
+   re-diff. **Run EVERY iteration autonomously** — re-sampling colours, re-slicing sprites, and
+   nudging alignment are all YOUR job, done from the crop you already have. 🚫 **NEVER stop at a low
+   score to hand the loop back to the dev, and NEVER ask the dev to do something the crop already
+   enables** (bring the app forward, confirm a colour, pick again). The dev performed exactly one
+   action — the pick — and is owed the finished, verified component. With pixels sampled fresh from
+   the crop (step 6), the first render is already close, so this is a few quiet internal rounds, not
+   a dev round-trip. Stop when:
    - `score ≥ 0.92` (pass), **or**
    - **6 iterations** on this component, **or**
    - two consecutive iterations improve `score` by **< 0.005** (diminishing returns).
-   Report the final score per component; never silently accept a low score.
+   Report the final score per component; never silently accept a low score — but reaching the stop
+   condition is YOUR call to make and report, not a question to bounce to the dev.
 
 10. **Compose & final-verify.** Assemble verified components into the full page at
     the window's point size, render, and `compare_images` against the
@@ -235,9 +265,12 @@ persist is the skill (with its `_shared/`).
     audit the markup: **every icon, avatar, image, and font must be a real harvested asset** (from
     `extract_assets` / the cache) or a pixel-crop of the real element — **zero hand-drawn or
     placeholder assets** (no improvised `<svg><path>`, no initials-in-a-box avatars, no guessed
-    glyphs). Re-look at the diff heatmap with the icon/background regions specifically in mind. The
-    bar is **exact assets on the first attempt** — the user should never have to tell you an icon or
-    colour is wrong. If anything is still approximate, fix it (harvest/crop) before declaring done.
+    glyphs). Re-look at the diff heatmap with the icon/background regions specifically in mind. **Also
+    confirm every colour — especially the container/gap background — was sampled from THIS run's
+    capture (the fresh crop), not a cached constant or older capture.** The bar is **exact assets and
+    exact colours on the first attempt** — the user should never have to tell you an icon, background,
+    or colour is wrong. If anything is still approximate, fix it (harvest/crop/re-sample) before
+    declaring done.
 
 ## vibe-extract tools (reference)
 `check_ax_permission`, `request_ax_permission`, `frontmost_app`, `list_windows`,

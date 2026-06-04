@@ -410,6 +410,7 @@ mod tests {
             window_bounds: None,
             click: None,
             ax_shallow: false,
+            crop_path: None,
         }
     }
 

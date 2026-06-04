@@ -507,6 +507,7 @@ pub async fn extract_frontmost_window_with_opts(
             // A deliberate whole-window capture, not a click pick.
             click: None,
             ax_shallow: false,
+            crop_path: None,
         }
     };
 

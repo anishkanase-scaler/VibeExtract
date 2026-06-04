@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Pragmatic per-app reuse cache for /replicate-ui.
 
+GOLDEN RULE: reuse the METHOD, never stale PIXELS. The current capture (for a
+selected component, the pick-time crop) is the single source of truth for every
+pixel — colours AND sprites. A prior run's capture can be a different theme/state,
+so copying its colours/sprites/images/window.png silently ships a wrong background
+shade or a stale icon. This module reports what's cached, but the skill reuses only
+the stable METHOD (generator script + layout/coordinate map, text fonts, grid-OCR
+keyed to a byte-identical capture) and RE-DERIVES all pixels from the fresh capture.
+
 The FIRST page of an app pays full cost: harvest assets over CDP, OCR grid
 labels, slice ribbon sprites, hand-verify every component. Pages 2..N of the
 SAME app are "similar pages" — identical chrome, fonts, icons, toolbar; only the
-content/layout differs. This module reports what is already cached for an app so
-the skill can REUSE the stable parts and regenerate only what changed.
+content/layout differs. Reusing the method makes them cheap; pixels stay fresh.
 
 Three app-stable artifact classes live under `.replicate-ui/<app>/`:
 
@@ -187,28 +194,36 @@ def report(app_or_path: str, win_w=None, win_h=None) -> dict:
 
 def _print_report(r: dict):
     print(f"# Reuse cache for {r['app_root']}")
+    print("  ⚠️  REUSE THE METHOD, NEVER STALE PIXELS. Colours, sprite PNGs, images, and")
+    print("      window.png are RE-DERIVED from THIS run's capture (for a selected component,")
+    print("      the pick-time crop). A prior capture can be a different theme/state — copying")
+    print("      its pixels ships the wrong background shade or a stale icon. Reuse only the")
+    print("      generator/layout, the text fonts, and grid-OCR keyed to an identical capture.")
     if not r["exists"]:
         print("  (no cache yet — first page of this app; full cost)")
     a = r["assets"]
     if a["present"]:
-        print(f"  ✅ assets: REUSE — {a.get('fonts',0)} fonts, "
-              f"{a.get('icons',0)} icon-glyphs, {a.get('svgIcons',0)} svg, "
-              f"{a.get('images',0)} images ({a.get('age_days')}d old). "
-              f"SKIP relaunch_with_debug_port + extract_assets.")
+        print(f"  ✅ FONTS: reuse {a.get('fonts',0)} cached woff2 verbatim. "
+              f"❌ icons/svg/images ({a.get('icons',0)}/{a.get('svgIcons',0)}/{a.get('images',0)}, "
+              f"{a.get('age_days')}d old): RE-HARVEST live via extract_assets (reads the live "
+              f"renderer — never stale); do NOT copy the old pixels.")
     else:
         print("  ⬜ assets: none — harvest with extract_assets (Electron) if needed.")
     g = r["grid_labels"]
     if g["present"]:
         print(f"  ✅ grid labels: REUSE — {g.get('cols',0)} cols, {g.get('rows',0)} rows "
-              f"cached ({g.get('age_days')}d old). SKIP OCR.")
+              f"cached ({g.get('age_days')}d old). SKIP OCR (gridtext.py reuses only if the "
+              f"capture is byte-identical).")
     else:
         print("  ⬜ grid labels: none — gridtext.py will OCR on first run (if a grid app).")
     if r["sprites_cached"]:
-        print(f"  ✅ sprites: {r['sprites_cached']} cached — identical ribbon icons reuse files.")
+        print(f"  ⚠️  sprites: {r['sprites_cached']} cached, but RE-SLICE from this run's capture — "
+              f"content-addressed files dedupe identical crops, yet fresh pixels avoid stale icons.")
     p = r["prior_replica"]
     if p["present"]:
-        print(f"  ✅ prior replica: START FROM {p['path']} ({p['bytes']}B, "
-              f"{p.get('age_days')}d old) — copy it, diff-edit only changed regions.")
+        print(f"  ✅ prior replica: REUSE THE GENERATOR/LAYOUT from {p['path']} ({p['bytes']}B, "
+              f"{p.get('age_days')}d old) — but RE-RUN it against the FRESH capture so colours + "
+              f"sprites are re-derived. Do NOT ship the old index.html's pixels.")
     else:
         print("  ⬜ prior replica: none — generate from scratch.")
 

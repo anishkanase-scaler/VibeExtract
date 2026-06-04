@@ -74,6 +74,14 @@ pub struct PickedElement {
     /// `bounds`/`role`; re-resolve at `click` (extract_component / the CDP ladder).
     #[serde(default)]
     pub ax_shallow: bool,
+    /// Absolute path to a PNG of this element captured AT PICK-TIME (when the
+    /// target app is frontmost by definition), cropped from a `screencapture -l`
+    /// of the owning window so it's free of the pick overlay's highlight border.
+    /// Lets downstream (`get_selection` → `/replicate-ui`) use the real pixels as
+    /// the native reference even after the app is closed/backgrounded. `None` when
+    /// the pick-time capture failed (best-effort) or for older records.
+    #[serde(default)]
+    pub crop_path: Option<String>,
 }
 
 #[cfg(test)]

@@ -541,6 +541,7 @@ pub fn pick_in_app(point: ScreenPoint, app_pid: i32) -> Result<PickedElement> {
         window_bounds,
         click: Some(point),
         ax_shallow,
+        crop_path: None,
     })
 }
 
@@ -681,6 +682,7 @@ pub fn pick(point: ScreenPoint) -> Result<PickedElement> {
         window_bounds,
         click: Some(point),
         ax_shallow,
+        crop_path: None,
     })
 }
 
