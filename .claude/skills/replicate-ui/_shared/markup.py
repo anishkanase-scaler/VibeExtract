@@ -53,3 +53,44 @@ def el(role: str, inner: str = "", extra_attrs: dict = None,
     if extra_attrs:
         attrs.update(extra_attrs)
     return f"<{tag}{attrs_str(attrs)}>{inner}</{tag}>"
+
+
+def _bounds_str(b) -> str:
+    """`{x,y,w,h}` (an AX node's serialized bounds) → "x,y,w,h" in points, or ""."""
+    if not b:
+        return ""
+    try:
+        return f"{b['x']:.0f},{b['y']:.0f},{b['w']:.0f},{b['h']:.0f}"
+    except (KeyError, TypeError):
+        return ""
+
+
+def el_from_node(node: dict, inner: str = "", extra_attrs: dict = None,
+                 cls: str = None, style: str = None) -> str:
+    """Render an element straight from an AX node dict (a node from `ax_tree.json`
+    / the `ax_tree` MCP result) — the role drives the tag, AND the node's semantics
+    are stamped on as `data-ax-*` so the generated HTML carries the AX tree itself
+    (self-describing markup + enables an AX overlay; see SKILL step 6). The single
+    choke point for AX metadata so no per-app generator re-implements it.
+
+        markup.el_from_node(node, inner=icon, cls="ctl", style=f"left:{x}px;top:{y}px")
+        # → <button class="ve-btn ctl" data-ax-role="AXButton" data-ax-name="Share"
+        #           data-ax-bounds="1081,65,91,24" style="left:…">…</button>
+
+    `extra_attrs` (e.g. aria-pressed, aria-label) win on conflict."""
+    role = node.get("role", "_default")
+    ax = {"data-ax-role": role}
+    if node.get("name"):
+        ax["data-ax-name"] = node["name"]
+    bs = _bounds_str(node.get("bounds"))
+    if bs:
+        ax["data-ax-bounds"] = bs
+    if node.get("value"):
+        ax["data-ax-value"] = str(node["value"])
+    if node.get("identifier"):
+        ax["data-ax-id"] = node["identifier"]
+    if node.get("subrole"):
+        ax["data-ax-subrole"] = node["subrole"]
+    if extra_attrs:
+        ax.update(extra_attrs)
+    return el(role, inner=inner, cls=cls, style=style, extra_attrs=ax)

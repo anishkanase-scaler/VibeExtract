@@ -22,6 +22,12 @@ pub struct CaptureResult {
     /// Free-form per-strategy diagnostics (passed to the export view's
     /// diagnostics panel).
     pub diagnostics: Vec<String>,
+    /// The captured accessibility tree as pretty-printed JSON (the serialized
+    /// `ax_macos::Node`). This is the semantic spec of the UI — every control's
+    /// role, name, value, bounds, children. `None` for strategies that produce
+    /// no AX node tree (CDP/source/screenshot-only) — surfaced honestly rather
+    /// than fabricated.
+    pub ax_tree: Option<String>,
 }
 
 impl CaptureResult {
@@ -33,6 +39,7 @@ impl CaptureResult {
             html: String::new(),
             screenshot_png_b64: None,
             diagnostics: Vec::new(),
+            ax_tree: None,
         }
     }
 }

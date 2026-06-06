@@ -213,6 +213,17 @@ impl AxElement {
         out
     }
 
+    /// Number of immediate AX children (AXChildren, falling back to AXContents
+    /// the way `deepen_at` does). A cheap "is this subtree rich?" signal:
+    /// Electron's window-filling shallow containers report ~0 (web content isn't
+    /// in AX), whereas a native window-sized group (e.g. Calendar's "Year
+    /// Calendar Area") reports many. Used by `is_shallow_pick` so a legitimate
+    /// native container isn't mistaken for an empty Electron placeholder.
+    pub fn child_count(&self) -> usize {
+        let n = self.array_attr("AXChildren").len();
+        if n > 0 { n } else { self.array_attr("AXContents").len() }
+    }
+
     /// Return this element's immediate parent via AXParent, or None at the
     /// top of the AX tree (e.g. on AXApplication). Caller owns the returned
     /// element.
@@ -528,7 +539,7 @@ pub fn pick_in_app(point: ScreenPoint, app_pid: i32) -> Result<PickedElement> {
         None => (None, None),
     };
     let app_path = pid_to_path(app_pid);
-    let ax_shallow = is_shallow_pick(&role, &bounds, point, window_bounds.as_ref());
+    let ax_shallow = is_shallow_pick(&role, &bounds, point, window_bounds.as_ref(), el.child_count());
     Ok(PickedElement {
         role,
         subrole,
@@ -605,11 +616,18 @@ pub fn deepen_at(start: AxElement, point: ScreenPoint) -> AxElement {
 /// `AXMenuBar` at `{0,0,W,30}` instead of the clicked sidebar/message). Such a
 /// result must NOT be committed as the pick: the caller keeps the click point
 /// and re-resolves at it via the CDP ladder.
+/// A window-filling element is treated as shallow only when it has at most this
+/// many AX children — the Electron signature (one big empty container because web
+/// content isn't exposed to AX). A native window-sized group has far more, so it
+/// stays a real, selectable element.
+const SHALLOW_MAX_CHILDREN: usize = 2;
+
 pub fn is_shallow_pick(
     role: &str,
     bounds: &ScreenRect,
     click: ScreenPoint,
     window_bounds: Option<&ScreenRect>,
+    child_count: usize,
 ) -> bool {
     // The element doesn't even cover where the user clicked.
     if !bounds.contains(click) {
@@ -622,11 +640,15 @@ pub fn is_shallow_pick(
     ) {
         return true;
     }
-    // The element is ~the whole window → no content leaf was found (shallow tree).
+    // The element is ~the whole window. This is shallow ONLY when it also has
+    // almost no AX children — i.e. Electron returned a big empty container
+    // because its web content isn't in the AX tree. A NATIVE app's window-sized
+    // group (e.g. Calendar's "Year Calendar Area", which holds the 12 month
+    // grids) is rich and IS a legitimate pick — don't shrink it to a click box.
     if let Some(win) = window_bounds {
         let win_area = win.w * win.h;
         let el_area = bounds.w * bounds.h;
-        if win_area > 0.0 && el_area >= 0.9 * win_area {
+        if win_area > 0.0 && el_area >= 0.9 * win_area && child_count <= SHALLOW_MAX_CHILDREN {
             return true;
         }
     }
@@ -668,7 +690,7 @@ pub fn pick(point: ScreenPoint) -> Result<PickedElement> {
 
     // Look up the process path via /proc-equivalent on macOS (libproc).
     let app_path = pid_to_path(pid);
-    let ax_shallow = is_shallow_pick(&role, &bounds, point, window_bounds.as_ref());
+    let ax_shallow = is_shallow_pick(&role, &bounds, point, window_bounds.as_ref(), el.child_count());
 
     Ok(PickedElement {
         role,
@@ -912,27 +934,38 @@ mod shallow_tests {
     fn menu_bar_is_shallow_even_when_it_contains_the_click() {
         // The exact bug: a Slack sidebar click resolves to the menu bar strip.
         let menubar = ScreenRect { x: 0.0, y: 0.0, w: 1440.0, h: 30.0 };
-        assert!(is_shallow_pick("AXMenuBar", &menubar, ScreenPoint { x: 700.0, y: 10.0 }, None));
+        assert!(is_shallow_pick("AXMenuBar", &menubar, ScreenPoint { x: 700.0, y: 10.0 }, None, 5));
     }
 
     #[test]
     fn click_outside_bounds_is_shallow() {
         let menubar = ScreenRect { x: 0.0, y: 0.0, w: 1440.0, h: 30.0 };
         // sidebar click far below the menu bar — bounds don't contain it.
-        assert!(is_shallow_pick("AXMenuBar", &menubar, ScreenPoint { x: 150.0, y: 400.0 }, None));
+        assert!(is_shallow_pick("AXMenuBar", &menubar, ScreenPoint { x: 150.0, y: 400.0 }, None, 0));
     }
 
     #[test]
     fn real_button_containing_click_is_not_shallow() {
         let btn = ScreenRect { x: 100.0, y: 380.0, w: 220.0, h: 34.0 };
         let win = ScreenRect { x: 0.0, y: 25.0, w: 1440.0, h: 875.0 };
-        assert!(!is_shallow_pick("AXButton", &btn, ScreenPoint { x: 150.0, y: 400.0 }, Some(&win)));
+        assert!(!is_shallow_pick("AXButton", &btn, ScreenPoint { x: 150.0, y: 400.0 }, Some(&win), 0));
     }
 
     #[test]
-    fn whole_window_sized_element_is_shallow() {
+    fn empty_window_sized_element_is_shallow() {
+        // Electron: AX returns one window-filling container with ~no children.
         let win = ScreenRect { x: 0.0, y: 25.0, w: 1440.0, h: 875.0 };
         let huge = ScreenRect { x: 0.0, y: 25.0, w: 1440.0, h: 870.0 }; // ~entire window
-        assert!(is_shallow_pick("AXGroup", &huge, ScreenPoint { x: 150.0, y: 400.0 }, Some(&win)));
+        assert!(is_shallow_pick("AXGroup", &huge, ScreenPoint { x: 150.0, y: 400.0 }, Some(&win), 0));
+    }
+
+    #[test]
+    fn rich_window_sized_native_group_is_not_shallow() {
+        // The Calendar bug: "Year Calendar Area" fills the window but holds the 12
+        // month grids — a legitimate pick. Must NOT be treated as shallow (which
+        // would shrink it to a tiny click-centered box on commit).
+        let win = ScreenRect { x: 0.0, y: 25.0, w: 935.0, h: 598.0 };
+        let area = ScreenRect { x: 0.0, y: 25.0, w: 935.0, h: 595.0 }; // ~entire window
+        assert!(!is_shallow_pick("AXGroup", &area, ScreenPoint { x: 400.0, y: 300.0 }, Some(&win), 12));
     }
 }

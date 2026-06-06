@@ -598,6 +598,33 @@
       background: linear-gradient(180deg, rgba(255,255,255,0.01), transparent);
     }
 
+    /* AX Tree tab — collapsible structured view of the captured Node tree. */
+    .axtree {
+      margin: 0;
+      padding: 18px 22px;
+      font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+      font-size: 12.5px;
+      line-height: 1.75;
+      overflow: auto;
+      color: var(--text);
+    }
+    .axtree .axnode { margin-left: 14px; white-space: nowrap; }
+    .axtree summary { cursor: pointer; }
+    .axtree summary:hover { filter: brightness(1.2); }
+    .axtree .ax-role { color: #7dd3fc; }
+    .axtree .ax-name { color: #fde68a; }
+    .axtree .ax-meta { color: #94a3b8; }
+
+    /* AX-overlay toggle (right side of the tab strip) */
+    #ax-overlay-btn {
+      margin-left: auto; align-self: center;
+      background: rgba(56,189,248,0.08); color: #9fb4c4;
+      border: 1px solid rgba(56,189,248,0.25); border-radius: 7px;
+      padding: 4px 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
+    }
+    #ax-overlay-btn:hover { color: var(--text); border-color: rgba(56,189,248,0.5); }
+    #ax-overlay-btn.on { background: #2b7de0; color: #fff; border-color: #2b7de0; }
+
     .diagnostics {
       padding: 20px 24px;
       font-size: 12.5px;
@@ -765,13 +792,16 @@
           <div class="actions">
             <button id="save-html" class="secondary">💾 Save HTML</button>
             <button id="save-toon" class="secondary">💾 Save TOON</button>
+            <button id="save-axtree" class="secondary">💾 Save AX tree</button>
           </div>
         </div>
         <div class="tabs">
           <button class="tab-btn active" data-tab="preview">Preview</button>
           <button class="tab-btn" data-tab="html">HTML</button>
           <button class="tab-btn" data-tab="toon">TOON</button>
+          <button class="tab-btn" data-tab="axtree">AX Tree</button>
           <button class="tab-btn" data-tab="diagnostics">Diagnostics</button>
+          <button id="ax-overlay-btn" title="Hover elements in the Preview to inspect their AX role / name / bounds" style="display:none">⌖ AX overlay</button>
         </div>
         <div class="tab-body active" data-tab="preview">
           <iframe class="preview" id="preview-iframe" sandbox="allow-scripts"></iframe>
@@ -781,6 +811,9 @@
         </div>
         <div class="tab-body" data-tab="toon">
           <pre class="code" id="toon-code"></pre>
+        </div>
+        <div class="tab-body" data-tab="axtree">
+          <div class="axtree" id="axtree-view"></div>
         </div>
         <div class="tab-body" data-tab="diagnostics">
           <div class="diagnostics" id="diagnostics-list"></div>
@@ -893,8 +926,10 @@
       $('result-view').style.display = 'none';
       $('empty-state').style.display = 'flex';
       $('preview-iframe').srcdoc = '';
+      $('ax-overlay-btn').style.display = 'none';
       $('html-code').textContent = '';
       $('toon-code').textContent = '';
+      $('axtree-view').innerHTML = '';
       $('diagnostics-list').innerHTML = '';
       $('strategy-badge').textContent = 'native_ax';
       $('strategy-badge').className = 'strategy';
@@ -904,6 +939,213 @@
     listen('toast', (event) => {
       toast(event.payload || '', { warn: true, ms: 5000 });
     });
+
+    // A finished /replicate-ui extraction pushed in by the `show_replica` MCP tool —
+    // a self-contained replica (assets already inlined) + its AX tree. Display it in
+    // the same result panel as a native capture (Preview / HTML / AX Tree tabs).
+    listen('show-replica', (event) => {
+      const r = event.payload || {};
+      // HTML tab = the readable, indented DOM of the original source (relative paths,
+      // no inlined base64). Preview iframe = the self-contained inlined html.
+      const prettySource = prettyHtml(r.source || r.html || '');
+      const toon = axTreeToToon(r.ax_tree);
+      lastResult = { strategy: 'replica', fidelity: r.title || '', toon,
+        html: r.source || r.html || '', ax_tree: r.ax_tree || null,
+        picked_summary: r.dir || '', count: 1 };
+      $('empty-state').style.display = 'none';
+      $('result-view').style.display = 'flex';
+      const badge = $('strategy-badge');
+      badge.textContent = `replica · ${r.title || ''}`;
+      badge.className = 'strategy';
+      $('picked-info').textContent = r.dir || '';
+      // Inject the AX hover-inspect overlay into the previewed HTML (reads the
+      // data-ax-* already on every element). Then show the toggle + reset it off.
+      $('preview-iframe').srcdoc = (r.html || '') + AX_OVERLAY_SNIPPET;
+      $('ax-overlay-btn').style.display = '';
+      axOverlaySet(false);
+      $('html-code').textContent = prettySource || '(empty)';
+      $('toon-code').textContent = toon || '(no AX tree)';
+      renderAxTree($('axtree-view'), r.ax_tree);
+      $('diagnostics-list').innerHTML =
+        `<div class="item">Loaded /replicate-ui extraction from ${r.dir || '(unknown)'}</div>`;
+      // Jump to the Preview tab.
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'preview'));
+      document.querySelectorAll('.tab-body').forEach(b => b.classList.toggle('active', b.dataset.tab === 'preview'));
+      toast(`Loaded replica: ${r.title || ''}`);
+    });
+
+    // Self-contained AX hover-inspect overlay appended to the previewed HTML. It
+    // reads the data-ax-* on each element (data-role for native captures) and, when
+    // toggled on, outlines the hovered element + shows role · "name" · [bounds].
+    // Its closing tag is written escaped (as <\/script>, see end of the template) so
+    // the HTML parser doesn't cut THIS module script short.
+    const AX_OVERLAY_SNIPPET = `
+<style id="ve-ax-style">
+  .ve-ax-hi{ outline:2px solid #38bdf8 !important; outline-offset:-1px; background:rgba(56,189,248,.14)!important; }
+  #ve-ax-tip{ position:fixed; z-index:2147483647; pointer-events:none; display:none;
+    background:#0d1117; color:#d7dce3; font:11px/1.45 ui-monospace,Menlo,monospace;
+    padding:4px 8px; border:1px solid #30363d; border-radius:6px; max-width:340px; white-space:nowrap; }
+  #ve-ax-tip .r{color:#7dd3fc} #ve-ax-tip .n{color:#fde68a} #ve-ax-tip .m{color:#8b949e}
+</style>
+<div id="ve-ax-tip"></div>
+<script>(function(){
+  var on=false, tip=document.getElementById('ve-ax-tip'), last=null;
+  function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function clear(){ if(last){last.classList.remove('ve-ax-hi');last=null;} if(tip)tip.style.display='none'; }
+  window.addEventListener('message',function(e){
+    if(e.data&&typeof e.data.veAxOverlay!=='undefined'){ on=!!e.data.veAxOverlay; if(!on)clear(); }
+  });
+  document.addEventListener('mousemove',function(e){
+    if(!on)return;
+    var el=(e.target&&e.target.closest)?e.target.closest('[data-ax-role],[data-role]'):null;
+    if(el!==last){ if(last)last.classList.remove('ve-ax-hi'); last=el; if(el)el.classList.add('ve-ax-hi'); }
+    if(!el){ tip.style.display='none'; return; }
+    var role=el.getAttribute('data-ax-role')||el.getAttribute('data-role')||'',
+        name=el.getAttribute('data-ax-name')||'', val=el.getAttribute('data-ax-value')||'',
+        b=el.getAttribute('data-ax-bounds')||'', id=el.getAttribute('data-ax-id')||'';
+    tip.innerHTML='<span class="r">'+esc(role)+'</span>'+(name?' <span class="n">"'+esc(name)+'"</span>':'')+
+      (val?' <span class="m">= '+esc(val)+'</span>':'')+(b?' <span class="m">['+esc(b)+']</span>':'')+(id?' <span class="m">#'+esc(id)+'</span>':'');
+    tip.style.display='block';
+    tip.style.left=Math.min(e.clientX+12, window.innerWidth-tip.offsetWidth-6)+'px';
+    tip.style.top=Math.min(e.clientY+14, window.innerHeight-tip.offsetHeight-6)+'px';
+  },true);
+  document.addEventListener('mouseleave',clear,true);
+})();<\/script>`;
+
+    let axOverlayOn = false;
+    function axOverlaySet(v) {
+      axOverlayOn = v;
+      const btn = $('ax-overlay-btn'); if (btn) btn.classList.toggle('on', v);
+      const f = $('preview-iframe'); if (f && f.contentWindow) f.contentWindow.postMessage({ veAxOverlay: v }, '*');
+    }
+    $('ax-overlay-btn').addEventListener('click', () => axOverlaySet(!axOverlayOn));
+
+    // Pretty-print an HTML source string as an indented DOM tree (DevTools "inspect"
+    // style) using the webview's own parser. Output is plain text for the <pre>.
+    const VOID_TAGS = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
+    function fmtAttrs(el) {
+      return [...el.attributes].map(a => ` ${a.name}="${a.value}"`).join('');
+    }
+    function fmtNode(node, depth, out) {
+      const pad = '  '.repeat(depth);
+      if (node.nodeType === 3) { // text
+        const t = node.textContent.replace(/\s+/g, ' ').trim();
+        if (t) out.push(pad + t);
+        return;
+      }
+      if (node.nodeType !== 1) return; // skip comments etc.
+      const tag = node.tagName.toLowerCase();
+      const open = `<${tag}${fmtAttrs(node)}>`;
+      if (tag === 'style' || tag === 'script') { // raw-text: keep body, indented
+        out.push(pad + open);
+        node.textContent.split('\n').map(l => l.trim()).filter(Boolean).forEach(l => out.push(pad + '  ' + l));
+        out.push(pad + `</${tag}>`);
+        return;
+      }
+      if (VOID_TAGS.has(tag)) { out.push(pad + open); return; }
+      const kids = [...node.childNodes].filter(k => k.nodeType !== 3 || k.textContent.trim());
+      if (kids.length === 1 && kids[0].nodeType === 3) { // single text child → inline
+        out.push(`${pad}${open}${kids[0].textContent.replace(/\s+/g,' ').trim()}</${tag}>`);
+        return;
+      }
+      if (kids.length === 0) { out.push(`${pad}${open}</${tag}>`); return; }
+      out.push(pad + open);
+      kids.forEach(k => fmtNode(k, depth + 1, out));
+      out.push(pad + `</${tag}>`);
+    }
+    function prettyHtml(src) {
+      if (!src) return '';
+      try {
+        const doc = new DOMParser().parseFromString(src, 'text/html');
+        const out = [];
+        if (/<!doctype/i.test(src)) out.push('<!DOCTYPE html>');
+        fmtNode(doc.documentElement, 0, out);
+        return out.join('\n');
+      } catch (e) { return src; }
+    }
+
+    // Build a TOON-style text outline from the AX tree JSON (same shape the native
+    // TOON uses: `role "name" value="…" pos=(x,y) size=(w×h) #id { … }`).
+    function axTreeToToon(jsonStr) {
+      if (!jsonStr) return '';
+      let data; try { data = JSON.parse(jsonStr); } catch (e) { return jsonStr; }
+      const lines = [];
+      const walk = (n, d) => {
+        if (!n) return;
+        const pad = '  '.repeat(d);
+        const role = (n.role || '?') + (n.subrole ? ':' + n.subrole : '');
+        const name = n.name ? ` "${n.name}"` : '';
+        const val = (n.value != null && n.value !== '') ? ` value="${n.value}"` : '';
+        const b = n.bounds ? ` pos=(${Math.round(n.bounds.x)},${Math.round(n.bounds.y)}) size=(${Math.round(n.bounds.w)}×${Math.round(n.bounds.h)})` : '';
+        const id = n.identifier ? ` #${n.identifier}` : '';
+        const kids = n.children || [];
+        lines.push(pad + role + name + val + b + id + (kids.length ? ' {' : ''));
+        kids.forEach(c => walk(c, d + 1));
+        if (kids.length) lines.push(pad + '}');
+      };
+      if (Array.isArray(data)) data.forEach(e => walk(e.ax_tree || e, 0));
+      else walk(data, 0);
+      return lines.join('\n');
+    }
+
+    // --- AX Tree rendering ---------------------------------------------------
+    // r.ax_tree is pretty-printed JSON: either a single Node {role,name,value,
+    // bounds,children,…} (one element) or an array of {element,role,name,ax_tree}
+    // (multi-element capture). Render it as a collapsible <details> tree.
+    function axEsc(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+    function axLabel(node) {
+      if (!node) return '<span class="ax-meta">(null)</span>';
+      const role = (node.role || '?') + (node.subrole ? ':' + node.subrole : '');
+      let h = '<span class="ax-role">' + axEsc(role) + '</span>';
+      if (node.name) h += ' <span class="ax-name">"' + axEsc(node.name) + '"</span>';
+      if (node.value != null && node.value !== '')
+        h += ' <span class="ax-meta">= ' + axEsc(String(node.value).slice(0, 80)) + '</span>';
+      const b = node.bounds;
+      if (b) h += ' <span class="ax-meta">[' + Math.round(b.x) + ',' + Math.round(b.y) +
+        ' ' + Math.round(b.w) + '×' + Math.round(b.h) + ']</span>';
+      if (node.identifier) h += ' <span class="ax-meta">#' + axEsc(node.identifier) + '</span>';
+      return h;
+    }
+    function axNode(node) {
+      const kids = node && node.children && node.children.length ? node.children : null;
+      const wrap = document.createElement(kids ? 'details' : 'div');
+      wrap.className = 'axnode';
+      if (kids) {
+        wrap.open = true;
+        const s = document.createElement('summary');
+        s.innerHTML = axLabel(node);
+        wrap.appendChild(s);
+        kids.forEach(c => wrap.appendChild(axNode(c)));
+      } else {
+        wrap.innerHTML = axLabel(node);
+      }
+      return wrap;
+    }
+    function renderAxTree(container, jsonStr) {
+      container.innerHTML = '';
+      if (!jsonStr) { container.textContent = '(none — this strategy has no AX tree)'; return; }
+      let data;
+      try { data = JSON.parse(jsonStr); }
+      catch (e) { container.textContent = jsonStr; return; }
+      if (Array.isArray(data)) {
+        data.forEach(entry => {
+          const det = document.createElement('details');
+          det.open = true; det.className = 'axnode';
+          const s = document.createElement('summary');
+          s.innerHTML = '<span class="ax-meta">Element ' + entry.element + ' — </span>' +
+            '<span class="ax-role">' + axEsc(entry.role || '') + '</span>' +
+            (entry.name ? ' <span class="ax-name">"' + axEsc(entry.name) + '"</span>' : '');
+          det.appendChild(s);
+          if (entry.ax_tree) det.appendChild(axNode(entry.ax_tree));
+          else { const d = document.createElement('div'); d.className = 'axnode'; d.innerHTML = '<span class="ax-meta">(no AX tree)</span>'; det.appendChild(d); }
+          container.appendChild(det);
+        });
+      } else {
+        container.appendChild(axNode(data));
+      }
+    }
 
     function renderResult(r) {
       lastResult = r;
@@ -918,12 +1160,15 @@
       else if ((r.strategy || '').includes('native_ax')) badge.classList.add('warn');
 
       $('picked-info').textContent = r.picked_summary || '';
+      // Native captures have their own in-iframe AX overlay; hide the replica toggle.
+      $('ax-overlay-btn').style.display = 'none';
 
       const iframe = $('preview-iframe');
       iframe.srcdoc = r.html || '<!DOCTYPE html><body style="font-family:sans-serif;padding:24px;color:#666">No HTML output.</body>';
 
       $('html-code').textContent = r.html || '(empty)';
       $('toon-code').textContent = r.toon || '(empty)';
+      renderAxTree($('axtree-view'), r.ax_tree);
 
       const diag = $('diagnostics-list');
       diag.innerHTML = '';
@@ -967,6 +1212,14 @@
       if (!lastResult) return;
       try {
         const path = await invoke('save_to_disk', { name: `vibe-extract-${Date.now()}.toon`, contents: lastResult.toon });
+        toast(`Saved: ${path}`);
+      } catch (e) { toast(`Save failed: ${e}`, { warn: true, ms: 4500 }); }
+    });
+    $('save-axtree').addEventListener('click', async () => {
+      if (!lastResult) return;
+      if (!lastResult.ax_tree) { toast('No AX tree for this capture (try a native macOS app).', { warn: true, ms: 4500 }); return; }
+      try {
+        const path = await invoke('save_to_disk', { name: `vibe-extract-${Date.now()}.json`, contents: lastResult.ax_tree });
         toast(`Saved: ${path}`);
       } catch (e) { toast(`Save failed: ${e}`, { warn: true, ms: 4500 }); }
     });

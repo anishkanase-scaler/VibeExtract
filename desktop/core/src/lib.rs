@@ -29,6 +29,8 @@ pub mod ax_macos;
 pub mod bundle_macos;
 #[cfg(target_os = "macos")]
 pub mod event_tap_macos;
+#[cfg(target_os = "macos")]
+pub mod app_freeze_macos;
 
 #[cfg(target_os = "windows")]
 pub mod uia_windows;

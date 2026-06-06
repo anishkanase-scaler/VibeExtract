@@ -134,6 +134,14 @@ pub struct CompareImagesParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ShowReplicaParam {
+    /// Absolute path to a finished /replicate-ui extraction folder — the dir that
+    /// holds `index.html` (the replica), optional `ax_tree.json`, and its
+    /// `icons/`/`assets/`. The app loads + displays these in its result panel.
+    pub dir: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExtractAssetsParam {
     /// CDP page-target index (into the debug port's `/json` page list).
     /// Defaults to 0 — the app's main window.

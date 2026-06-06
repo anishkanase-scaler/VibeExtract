@@ -23,7 +23,7 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde::Serialize;
 use serde_json::json;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 
 use base64::Engine as _;
@@ -41,9 +41,13 @@ static SHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct VibeExtractMcp {
     /// Where saved screenshots land (so Playwright/compare_images can reference
-    /// them by path). The service is intentionally decoupled from `AppHandle`
-    /// so it's testable without a running Tauri app.
+    /// them by path). The service is decoupled from `AppHandle` for testability;
+    /// the live server attaches one via [`with_app`] so `show_replica` can push
+    /// results to the app window.
     out_dir: std::path::PathBuf,
+    /// Present only when served from the running app — lets UI-facing tools
+    /// (`show_replica`) emit events to the webview. `None` in unit tests.
+    app: Option<AppHandle>,
     tool_router: ToolRouter<VibeExtractMcp>,
 }
 
@@ -51,8 +55,15 @@ impl VibeExtractMcp {
     pub fn new(out_dir: std::path::PathBuf) -> Self {
         Self {
             out_dir,
+            app: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Attach the Tauri app handle so UI-facing tools can drive the window.
+    pub fn with_app(mut self, app: AppHandle) -> Self {
+        self.app = Some(app);
+        self
     }
 
     fn output_dir(&self) -> std::path::PathBuf {
@@ -511,6 +522,55 @@ impl VibeExtractMcp {
             Err(e) => tool_err(e.to_string()),
         }
     }
+
+    #[tool(
+        description = "Display a finished /replicate-ui extraction INSIDE the VibeExtract app's result panel (Preview + HTML + AX Tree tabs) — the in-app alternative to serving the replica at a localhost URL. `dir` is the extraction output folder (holds index.html, optional ax_tree.json, and icons/assets). Reads index.html and INLINES its local assets so the preview is self-contained, reads ax_tree.json if present, pushes both to the app window, and brings it to the front. Call this at the end of a /replicate-ui run instead of starting an http.server."
+    )]
+    async fn show_replica(
+        &self,
+        Parameters(p): Parameters<ShowReplicaParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let app = match &self.app {
+            Some(a) => a,
+            None => return tool_err("app handle unavailable — the MCP server isn't attached to a UI window"),
+        };
+        let dir = std::path::PathBuf::from(&p.dir);
+        let index = dir.join("index.html");
+        let raw = std::fs::read_to_string(&index)
+            .map_err(|e| ErrorData::internal_error(format!("read {}: {e}", index.display()), None))?;
+        let html = inline_replica_assets(&dir, &raw);
+        let ax_tree = std::fs::read_to_string(dir.join("ax_tree.json")).ok();
+        let title = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("replica")
+            .to_string();
+        app.emit(
+            "show-replica",
+            json!({
+                // Self-contained (assets inlined as data: URIs) — for the Preview iframe.
+                "html": html,
+                // Original source (relative asset paths, no base64) — the HTML tab
+                // pretty-prints THIS as a readable, indented DOM (DevTools-style).
+                "source": raw,
+                "ax_tree": ax_tree,
+                "title": title,
+                "dir": dir.to_string_lossy(),
+            }),
+        )
+        .map_err(|e| ErrorData::internal_error(format!("emit show-replica: {e}"), None))?;
+        // Bring the app window forward so the result is visible immediately.
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+        ok_value(json!({
+            "shown": true,
+            "dir": dir.to_string_lossy(),
+            "ax_tree": ax_tree.is_some(),
+            "note": "Replica is now in the app's result panel (Preview / HTML / AX Tree)."
+        }))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -540,6 +600,104 @@ fn ok_value(v: serde_json::Value) -> Result<CallToolResult, ErrorData> {
 
 fn tool_err(msg: impl Into<String>) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![Content::text(msg.into())]))
+}
+
+// --- replica asset inlining (for show_replica) -------------------------------
+// The skill writes index.html referencing local files (icons/*.png, assets/…,
+// fonts). To show it in an iframe `srcdoc` (no base URL), rewrite each local
+// reference to a self-contained data: URI.
+
+fn mime_for(path: &str) -> &'static str {
+    let p = path.to_ascii_lowercase();
+    if p.ends_with(".png") { "image/png" }
+    else if p.ends_with(".jpg") || p.ends_with(".jpeg") { "image/jpeg" }
+    else if p.ends_with(".svg") { "image/svg+xml" }
+    else if p.ends_with(".gif") { "image/gif" }
+    else if p.ends_with(".webp") { "image/webp" }
+    else if p.ends_with(".woff2") { "font/woff2" }
+    else if p.ends_with(".woff") { "font/woff" }
+    else if p.ends_with(".ttf") { "font/ttf" }
+    else if p.ends_with(".otf") { "font/otf" }
+    else { "application/octet-stream" }
+}
+
+/// A relative local reference → data: URI, or None to leave it untouched
+/// (absolute/remote/data URLs, or files that don't exist under `dir`).
+fn data_uri(dir: &std::path::Path, rel: &str) -> Option<String> {
+    let r = rel.trim();
+    if r.is_empty()
+        || r.starts_with("data:")
+        || r.starts_with("http://")
+        || r.starts_with("https://")
+        || r.starts_with("//")
+        || r.starts_with('/')
+        || r.starts_with('#')
+    {
+        return None;
+    }
+    let clean = r.split(['?', '#']).next().unwrap_or(r);
+    let bytes = std::fs::read(dir.join(clean)).ok()?;
+    Some(format!(
+        "data:{};base64,{}",
+        mime_for(clean),
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
+/// Replace every `<delim>PATH<quote>` (e.g. `src="icons/x.png"`) whose PATH is a
+/// local file with its data: URI.
+fn replace_quoted(html: &str, delim: &str, dir: &std::path::Path) -> String {
+    let quote = delim.chars().last().unwrap();
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find(delim) {
+        out.push_str(&rest[..i + delim.len()]);
+        rest = &rest[i + delim.len()..];
+        if let Some(end) = rest.find(quote) {
+            let path = &rest[..end];
+            out.push_str(&data_uri(dir, path).unwrap_or_else(|| path.to_string()));
+            out.push(quote);
+            rest = &rest[end + quote.len_utf8()..];
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace CSS `url(PATH)` (optionally quoted) local refs with data: URIs.
+fn replace_css_urls(html: &str, dir: &std::path::Path) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find("url(") {
+        out.push_str(&rest[..i + 4]);
+        rest = &rest[i + 4..];
+        let (skip, close): (usize, char) = match rest.chars().next() {
+            Some('"') => (1, '"'),
+            Some('\'') => (1, '\''),
+            _ => (0, ')'),
+        };
+        out.push_str(&rest[..skip]);
+        rest = &rest[skip..];
+        if let Some(end) = rest.find(close) {
+            let path = &rest[..end];
+            out.push_str(&data_uri(dir, path).unwrap_or_else(|| path.to_string()));
+            rest = &rest[end..];
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn inline_replica_assets(dir: &std::path::Path, html: &str) -> String {
+    let mut s = html.to_string();
+    for delim in ["src=\"", "src='", "href=\"", "href='"] {
+        s = replace_quoted(&s, delim, dir);
+    }
+    replace_css_urls(&s, dir)
 }
 
 /// Resolve a compare_images side from a file path or base64 string.
@@ -676,8 +834,9 @@ pub async fn start(app: AppHandle) -> Result<McpStatus, String> {
         ]);
 
     let out_dir = app.state::<crate::OutputDir>().0.clone();
+    let app_for_mcp = app.clone();
     let service = StreamableHttpService::new(
-        move || Ok(VibeExtractMcp::new(out_dir.clone())),
+        move || Ok(VibeExtractMcp::new(out_dir.clone()).with_app(app_for_mcp.clone())),
         Arc::new(LocalSessionManager::default()),
         config,
     );
@@ -778,6 +937,7 @@ mod tests {
             "extract_component",
             "extract_assets",
             "compare_images",
+            "show_replica",
         ] {
             assert!(names.contains(&expected.to_string()), "missing tool {expected}: {names:?}");
         }

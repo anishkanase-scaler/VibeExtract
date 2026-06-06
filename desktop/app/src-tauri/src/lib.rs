@@ -79,6 +79,22 @@ struct PickSession {
     /// How many extra DOM-parent steps to widen the CDP hover by — ↑ increments,
     /// ↓ decrements. Lets the user grow row → list → sidebar and SEE each step.
     widen_level: u32,
+    /// Keyboard tree-navigation (↑ parent / ↓ child), ported from the web
+    /// extension's Alt+Arrow flow. `nav_stack` is the path walked UP, popped by ↓
+    /// to retrace before falling to the first child (web `wheelNavStack`).
+    nav_stack: Vec<PickedElement>,
+    /// True while the user is walking the tree via ↑/↓ and HASN'T moved the mouse
+    /// — the hover task freezes so it doesn't yank the highlight back to the
+    /// cursor (web `isScrollNavigating`). Any real cursor move clears it.
+    nav_active: bool,
+    /// Cursor position when nav last fired; the hover task ends nav once the
+    /// cursor moves away from it.
+    nav_anchor_cursor: Option<ScreenPoint>,
+    /// Freeze-panel hold (WPS PDF etc.): `Some(pid)` means that app is SUSPENDED
+    /// (SIGSTOP) so its hover panel stays frozen open while the cursor roams free.
+    /// Set after each pick; resumed (SIGCONT) on Esc / clear / stop, and briefly
+    /// around live AX work (overlay_click / walk_hover_ancestry).
+    freeze_pid: Option<i32>,
 }
 
 #[derive(Default)]
@@ -171,6 +187,8 @@ struct ExportPayload {
     html: String,
     screenshot_png_b64: Option<String>,
     diagnostics: Vec<String>,
+    /// Serialized AX tree (the semantic spec); `None` for non-AX strategies.
+    ax_tree: Option<String>,
     picked_summary: String,
     count: usize,
 }
@@ -524,6 +542,10 @@ async fn start_pick_mode(app: AppHandle) -> Result<(), String> {
         s.cdp_port = cdp_port;
         s.target_win = target_win;
         s.widen_level = 0;
+        s.nav_stack.clear();
+        s.nav_active = false;
+        s.nav_anchor_cursor = None;
+        unfreeze_app(&mut s.freeze_pid); // resume any frozen app (SIGCONT)
     }
 
     // Show the overlay window, size it to the primary monitor.
@@ -681,6 +703,97 @@ async fn stop_pick_mode(app: AppHandle) -> Result<(), String> {
 /// The unique seq also serves as a per-pick identity for the auto-trigger watcher.
 static PICK_CROP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Capture the picked element's pixels NOW (occlusion-immune via `screencapture -l`
+/// on the owning window, cropped to the element bounds) → sets `picked.crop_path`.
+/// Best-effort; shallow picks are skipped (their bounds are a click placeholder).
+/// Shared by the mouse click (`overlay_click`) and keyboard tree-nav (`walk_hover_ancestry`).
+async fn capture_pick_crop(app: &AppHandle, picked: &mut PickedElement) {
+    if picked.ax_shallow {
+        return;
+    }
+    let elem = picked.bounds;
+    let pid = picked.pid;
+    // Owning window: a normal-layer window containing the element, else any-layer
+    // containing it (menus/popovers live on layer>0), else first window for the pid.
+    let target_win = {
+        let wins = vibe_extract_core::windows_list::list_windows();
+        let center = elem.center();
+        wins.iter()
+            .filter(|w| w.pid == pid && w.layer == 0)
+            .find(|w| w.bounds.contains(center))
+            .or_else(|| wins.iter().filter(|w| w.pid == pid).find(|w| w.bounds.contains(center)))
+            .or_else(|| wins.iter().find(|w| w.pid == pid && w.layer == 0))
+            .or_else(|| wins.iter().find(|w| w.pid == pid))
+            .map(|w| (w.window_id, w.bounds))
+    };
+    let Some((window_id, win_bounds)) = target_win else {
+        log::warn!("capture_pick_crop: no window for pid {} — skipping crop", pid);
+        return;
+    };
+    let dir = app.state::<OutputDir>().inner().0.clone();
+    let _ = std::fs::create_dir_all(&dir);
+    let seq = PICK_CROP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out = dir.join(format!("pick-crop-{}-{}-{}.png", pid, stamp, seq));
+    let out_for_task = out.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        vibe_extract_core::screenshot::capture_window_crop(window_id, win_bounds, elem, &out_for_task)
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => {
+            log::info!("capture_pick_crop: saved {}", out.display());
+            picked.crop_path = Some(out.to_string_lossy().into_owned());
+        }
+        Ok(Err(e)) => log::warn!("capture_pick_crop: failed: {}", e),
+        Err(e) => log::warn!("capture_pick_crop: task join error: {}", e),
+    }
+}
+
+/// Persist the current selection to `last-selection.json` (read by the MCP
+/// `get_selection` tool) and push the outlines + count to the overlay/main UI.
+fn persist_and_broadcast(app: &AppHandle, list: &[PickedElement]) {
+    let dir = app.state::<OutputDir>().inner().0.clone();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(js) = serde_json::to_string(list) {
+        let _ = std::fs::write(dir.join("last-selection.json"), js);
+    }
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let payload: Vec<OverlaySelectedPayload> = list
+            .iter()
+            .map(|p| OverlaySelectedPayload {
+                bounds: to_overlay_bounds(&p.bounds),
+                role: p.role.clone(),
+                name: p.name.clone(),
+            })
+            .collect();
+        let _ = overlay.emit("overlay-selections", payload);
+    }
+    let _ = app.emit("selection-count-changed", list.len());
+}
+
+/// Freeze the picked app (SIGSTOP) so its hover panel can't close while the cursor
+/// roams freely; record its pid in the session. No-op off macOS.
+fn freeze_app(freeze_pid: &mut Option<i32>, pid: i32) {
+    #[cfg(target_os = "macos")]
+    vibe_extract_core::app_freeze_macos::suspend(pid);
+    *freeze_pid = Some(pid);
+}
+
+/// Resume a frozen app (SIGCONT) and clear the flag. Returns the pid that was frozen
+/// so the caller can re-freeze it after a brief live operation (e.g. an AX query).
+fn unfreeze_app(freeze_pid: &mut Option<i32>) -> Option<i32> {
+    let p = freeze_pid.take();
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = p {
+        vibe_extract_core::app_freeze_macos::resume(pid);
+    }
+    p
+}
+
 #[tauri::command]
 async fn overlay_click(
     app: AppHandle,
@@ -700,7 +813,13 @@ async fn overlay_click(
     };
     let target_pid_opt = {
         let s = app.state::<PickSessionState>();
-        let guard = s.0.lock().unwrap();
+        let mut guard = s.0.lock().unwrap();
+        // If an app is frozen from a previous pick, resume it so this pick's AX +
+        // crop run on a live app. Its stale hover is useless now → force a fresh
+        // hit-test below by clearing last_hover.
+        if unfreeze_app(&mut guard.freeze_pid).is_some() {
+            guard.last_hover = None;
+        }
         guard.target_pid
     };
 
@@ -879,62 +998,11 @@ async fn overlay_click(
     // NOTE: the capture (screencapture + decode + crop) is awaited inline, so a
     // successful capture adds ~150-300ms before the highlight updates. Acceptable
     // for now; could be detached + back-filled if pick latency becomes an issue.
-    if !picked.ax_shallow {
-        let elem = picked.bounds;
-        let pid = picked.pid;
-        // Owning window: prefer a normal-layer (0) window that contains the
-        // element; then ANY-layer window that contains it (open menus, combobox
-        // dropdowns, popovers, sheets live on layer > 0 — without this they'd be
-        // mis-attributed to the main window and cropped at the wrong coords);
-        // then the first normal-layer / any window for this pid.
-        let target_win = {
-            let wins = vibe_extract_core::windows_list::list_windows();
-            let center = elem.center();
-            wins.iter()
-                .filter(|w| w.pid == pid && w.layer == 0)
-                .find(|w| w.bounds.contains(center))
-                .or_else(|| wins.iter().filter(|w| w.pid == pid).find(|w| w.bounds.contains(center)))
-                .or_else(|| wins.iter().find(|w| w.pid == pid && w.layer == 0))
-                .or_else(|| wins.iter().find(|w| w.pid == pid))
-                .map(|w| (w.window_id, w.bounds))
-        };
-        if let Some((window_id, win_bounds)) = target_win {
-            let dir = app.state::<OutputDir>().inner().0.clone();
-            let _ = std::fs::create_dir_all(&dir);
-            let seq = PICK_CROP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Wall-clock millis in the name so a crop_path is unique even across a
-            // binary restart (the seq resets to 0 each launch, and the target pid
-            // can recur — without this a post-restart first pick could collide
-            // with a pre-restart filename and confuse the watcher's new-pick check).
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let out = dir.join(format!("pick-crop-{}-{}-{}.png", pid, stamp, seq));
-            let out_for_task = out.clone();
-            let res = tokio::task::spawn_blocking(move || {
-                vibe_extract_core::screenshot::capture_window_crop(
-                    window_id, win_bounds, elem, &out_for_task,
-                )
-            })
-            .await;
-            match res {
-                Ok(Ok(())) => {
-                    log::info!("overlay_click: saved pick-time crop {}", out.display());
-                    picked.crop_path = Some(out.to_string_lossy().into_owned());
-                }
-                Ok(Err(e)) => log::warn!("overlay_click: pick-time crop failed: {}", e),
-                Err(e) => log::warn!("overlay_click: crop task join error: {}", e),
-            }
-        } else {
-            log::warn!(
-                "overlay_click: no window found for pid {} — skipping pick-time crop",
-                pid
-            );
-        }
-    } else {
-        log::info!("overlay_click: shallow pick — leaving crop_path None (re-resolve via CDP)");
-    }
+    // Capture the element's pixels NOW (occlusion-immune, cropped to the final
+    // bounds) so /replicate-ui has them even after the app closes. Shallow picks
+    // skip inside the helper (their bounds are a click placeholder → re-resolved
+    // via CDP later).
+    capture_pick_crop(&app, &mut picked).await;
 
     // Same-app constraint when shift-clicking.
     let state = app.state::<PickSessionState>();
@@ -964,7 +1032,14 @@ async fn overlay_click(
             s.selected.clear();
             s.selected.push(picked.clone());
             s.locked_pid = Some(picked.pid);
+            // A fresh click is a new nav anchor — drop any keyboard-walk path.
+            s.nav_stack.clear();
+            s.nav_active = false;
+            s.nav_anchor_cursor = None;
         }
+        // Freeze the picked app so its hover panel stays open while the cursor roams
+        // free (SIGSTOP). Released on Esc/clear/stop, or briefly for the next pick/nav.
+        freeze_app(&mut s.freeze_pid, picked.pid);
         s.selected.clone()
     };
     // Best-effort GC of the superseded selection's crops (outside the lock).
@@ -972,37 +1047,12 @@ async fn overlay_click(
         let _ = std::fs::remove_file(p);
     }
 
-    // Persist the current selection so the MCP `get_selection` tool — and thus
-    // `/replicate-ui` — can read exactly what the user picked. Written on every
-    // pick into the shared output dir (the MCP server reads from the same dir).
-    {
-        let dir = app.state::<OutputDir>().inner().0.clone();
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(js) = serde_json::to_string(&new_selected_list) {
-            let _ = std::fs::write(dir.join("last-selection.json"), js);
-        }
-    }
-
-    // Push updated outlines to the overlay.
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        let payload: Vec<OverlaySelectedPayload> = new_selected_list
-            .iter()
-            .map(|p| OverlaySelectedPayload {
-                bounds: to_overlay_bounds(&p.bounds),
-                role: p.role.clone(),
-                name: p.name.clone(),
-            })
-            .collect();
-        let _ = overlay.emit("overlay-selections", payload);
-    }
-
+    // Persist for the MCP `get_selection` tool + push outlines/count to the UI.
+    persist_and_broadcast(&app, &new_selected_list);
     log::info!(
         "overlay_click: selection list now has {} element(s)",
         new_selected_list.len()
     );
-
-    // Update main window's counter.
-    let _ = app.emit("selection-count-changed", new_selected_list.len());
 
     Ok(format!(
         "selected {} ({})",
@@ -1121,6 +1171,10 @@ async fn export_selection(app: AppHandle) -> Result<ExportPayload, String> {
         s.selected.clear();
         s.locked_pid = None;
         s.last_hover = None;
+        s.nav_stack.clear();
+        s.nav_active = false;
+        s.nav_anchor_cursor = None;
+        unfreeze_app(&mut s.freeze_pid); // resume any frozen app (SIGCONT)
     }
     let _ = app.emit("selection-count-changed", 0);
     if let Some(overlay) = app.get_webview_window("overlay") {
@@ -1147,6 +1201,7 @@ async fn export_selection(app: AppHandle) -> Result<ExportPayload, String> {
         html: result.html,
         screenshot_png_b64: result.screenshot_png_b64,
         diagnostics: result.diagnostics,
+        ax_tree: result.ax_tree,
         picked_summary: summary,
         count: selected.len(),
     })
@@ -1186,6 +1241,7 @@ async fn extract_frontmost_window_cmd(app: AppHandle) -> Result<ExportPayload, S
         html: result.html,
         screenshot_png_b64: result.screenshot_png_b64,
         diagnostics: result.diagnostics,
+        ax_tree: result.ax_tree,
         picked_summary: "entire frontmost window".into(),
         count: 1,
     })
@@ -1251,6 +1307,10 @@ async fn handle_electron_relaunch_flow(
         let mut s = state.0.lock().unwrap();
         s.active = false;
         s.last_hover = None;
+        s.nav_stack.clear();
+        s.nav_active = false;
+        s.nav_anchor_cursor = None;
+        unfreeze_app(&mut s.freeze_pid); // resume any frozen app (SIGCONT)
         // intentional: do NOT clear selected, locked_pid, or woken_pids
     }
     #[cfg(target_os = "macos")]
@@ -1535,160 +1595,296 @@ async fn walk_hover_ancestry(app: AppHandle, go_up: bool) -> Result<(), String> 
             return Ok(());
         }
     }
-    // Snapshot the current hover so we don't hold the mutex across AX FFI.
-    let (target_pid_opt, current) = {
+    // Snapshot the anchor (prefer the committed selection so ↑/↓ work AFTER a
+    // pick; else the live hover) + the nav stack, without holding the lock across
+    // AX FFI.
+    let (target_pid_opt, current, mut nav_stack, frozen_pid) = {
         let state = app.state::<PickSessionState>();
-        let s = state.0.lock().unwrap();
+        let mut s = state.0.lock().unwrap();
         if !s.active {
             return Err("pick mode not active".into());
         }
-        (s.target_pid, s.last_hover.clone())
+        let current = s.selected.last().cloned().or_else(|| s.last_hover.clone());
+        // If the panel's app is frozen, resume it for the live AX query below, then
+        // re-freeze right after (kept brief so the panel doesn't close).
+        let frozen = unfreeze_app(&mut s.freeze_pid);
+        (s.target_pid, current, s.nav_stack.clone(), frozen)
     };
     let Some(current) = current else {
-        return Err("no hovered element to walk from".into());
+        if let Some(pid) = frozen_pid {
+            let st = app.state::<PickSessionState>();
+            freeze_app(&mut st.0.lock().unwrap().freeze_pid, pid);
+        }
+        return Err("no element to walk from".into());
     };
     let our_pid = std::process::id() as i32;
 
-    // All AX work in a sync block so the (non-Send) AxElement handles drop
-    // before any .await.
-    let new_picked = {
-        // Re-acquire an AX handle for the current element. We have its bounds
-        // — hit-test at the center of the bounds via the target app's tree.
-        let center = current.bounds.center();
-        let cur_el = if let Some(pid) = target_pid_opt {
-            vibe_extract_core::ax_macos::element_at_in_app(center, pid)
-        } else {
-            vibe_extract_core::ax_macos::element_at(center)
-        };
-        let Some(cur_el) = cur_el else {
-            return Err("couldn't re-acquire AX handle for current hover".into());
-        };
+    let anchor_click = current.click;
 
-        if go_up {
-            // Walk to the immediate parent. Reject if it leaves the target
-            // app (e.g. parent is system root) or if the bounds are bogus.
-            let Some(parent) = cur_el.parent() else {
-                return Err("already at AX root — can't go higher".into());
-            };
-            let role = parent.str_attr("AXRole").unwrap_or_default();
-            let bounds = match parent.rect() {
-                Some(b) if b.w >= 1.0 && b.h >= 1.0 => b,
-                _ => {
-                    return Err(format!(
-                        "parent {} has no usable bounds — staying at current",
-                        role
-                    ))
-                }
-            };
-            let pid = parent.pid().unwrap_or(-1);
-            if pid == our_pid {
-                return Err("parent is in our own process — refusing to walk".into());
-            }
-            let name = parent
-                .str_attr("AXTitle")
-                .or_else(|| parent.str_attr("AXDescription"))
-                .or_else(|| parent.str_attr("AXLabel"))
-                .or_else(|| parent.str_attr("AXValue"))
-                .unwrap_or_default();
-            PickedElement {
-                role,
-                subrole: parent.str_attr("AXSubrole").filter(|s| !s.is_empty()),
-                name,
-                identifier: parent.str_attr("AXIdentifier").filter(|s| !s.is_empty()),
-                bounds,
-                pid,
-                app_path: vibe_extract_core::ax_macos::pid_to_path(pid),
-                window_title: None,
-                window_bounds: parent.enclosing_window().and_then(|w| w.rect()),
-                // Deliberate ↑ ancestry walk — preserve the anchor, not shallow.
-                click: current.click,
-                ax_shallow: false,
-                crop_path: None,
+    // Compute the navigation target via the AX tree (sync closure — the non-Send
+    // AxElement handles never cross an await). Ported from the web Alt+Arrow flow:
+    //   ↑ = next genuinely-larger ancestor (skips wrapper nodes; capped at window),
+    //   ↓ = retrace the ↑ path if possible, else the first child.
+    let computed: Result<PickedElement, String> = (|| {
+        if !go_up {
+            if let Some(prev) = nav_stack
+                .last()
+                .cloned()
+                .filter(|p| rect_inside(&p.bounds, &current.bounds))
+            {
+                nav_stack.pop();
+                Ok(prev)
+            } else {
+                nav_stack.clear();
+                let el = reacquire_current(target_pid_opt, &current)
+                    .ok_or("couldn't locate the current element in the AX tree")?;
+                ax_first_child_of(&el, &current.bounds, our_pid, target_pid_opt)
             }
         } else {
-            // Walk DOWN: find the deepest descendant under the cursor (or the
-            // bounds center if cursor isn't over the element anymore).
-            let pt = {
-                let c = vibe_extract_core::ax_macos::current_cursor();
-                if c.x >= current.bounds.x
-                    && c.x <= current.bounds.x + current.bounds.w
-                    && c.y >= current.bounds.y
-                    && c.y <= current.bounds.y + current.bounds.h
-                {
-                    c
-                } else {
-                    current.bounds.center()
-                }
-            };
-            let deeper = vibe_extract_core::ax_macos::deepen_at(cur_el, pt);
-            let role = deeper.str_attr("AXRole").unwrap_or_default();
-            let bounds = match deeper.rect() {
-                Some(b) if b.w >= 1.0 && b.h >= 1.0 => b,
-                _ => return Err(format!("child {} has no bounds", role)),
-            };
-            if bounds.w >= current.bounds.w && bounds.h >= current.bounds.h {
-                // No real deeper element — same or bigger. Nothing to go to.
-                return Err("no deeper element under cursor".into());
-            }
-            let pid = deeper.pid().unwrap_or(-1);
-            let name = deeper
-                .str_attr("AXTitle")
-                .or_else(|| deeper.str_attr("AXDescription"))
-                .or_else(|| deeper.str_attr("AXLabel"))
-                .or_else(|| deeper.str_attr("AXValue"))
-                .unwrap_or_default();
-            PickedElement {
-                role,
-                subrole: deeper.str_attr("AXSubrole").filter(|s| !s.is_empty()),
-                name,
-                identifier: deeper.str_attr("AXIdentifier").filter(|s| !s.is_empty()),
-                bounds,
-                pid,
-                app_path: vibe_extract_core::ax_macos::pid_to_path(pid),
-                window_title: None,
-                window_bounds: deeper.enclosing_window().and_then(|w| w.rect()),
-                // Deliberate ↓ ancestry walk — preserve the anchor, not shallow.
-                click: current.click,
-                ax_shallow: false,
-                crop_path: None,
-            }
+            let el = reacquire_current(target_pid_opt, &current)
+                .ok_or("couldn't locate the current element in the AX tree")?;
+            let parent = ax_parent_of(&el, &current.bounds, our_pid)?;
+            nav_stack.push(current.clone());
+            Ok(parent)
         }
-    };
+    })();
+    // Live AX query is done — re-freeze the app immediately (kept brief so the panel
+    // doesn't close), regardless of whether navigation succeeded.
+    if let Some(pid) = frozen_pid {
+        let st = app.state::<PickSessionState>();
+        freeze_app(&mut st.0.lock().unwrap().freeze_pid, pid);
+    }
+    let new_picked = computed?;
 
-    log::info!(
-        "walk_hover_ancestry({}): now {} \"{}\" bounds={}x{}",
-        if go_up { "up" } else { "down" },
-        new_picked.role,
-        new_picked.name,
-        new_picked.bounds.w,
-        new_picked.bounds.h
-    );
+    let mut picked = new_picked;
+    picked.click = anchor_click;
+    let cursor = vibe_extract_core::ax_macos::current_cursor();
 
-    // Push the new element into last_hover so the very next click commits it.
-    // Also push an outline event so the overlay redraws immediately.
-    {
+    // INSTANT commit — move the selection + highlight NOW so ↑/↓ feel immediate.
+    // The pixel crop is captured in the background below and back-filled, so the
+    // keypress never blocks on the ~200ms screencapture (that was the lag).
+    let list = {
         let state = app.state::<PickSessionState>();
         let mut s = state.0.lock().unwrap();
-        s.last_hover = Some(new_picked.clone());
-    }
+        if !s.active {
+            return Err("pick mode not active".into());
+        }
+        s.selected.clear();
+        s.selected.push(picked.clone());
+        s.locked_pid = Some(picked.pid);
+        s.last_hover = Some(picked.clone());
+        s.nav_stack = nav_stack;
+        // Freeze the hover task until the mouse actually moves, so it doesn't yank
+        // the highlight off the element we just navigated to (web isScrollNavigating).
+        s.nav_active = true;
+        s.nav_anchor_cursor = Some(cursor);
+        s.selected.clone()
+    };
+    persist_and_broadcast(&app, &list);
     if let Some(overlay) = app.get_webview_window("overlay") {
-        let payload = OverlayHoverPayload {
-            bounds: Some(OverlayBounds {
-                x: new_picked.bounds.x,
-                y: new_picked.bounds.y,
-                w: new_picked.bounds.w,
-                h: new_picked.bounds.h,
-            }),
-            role: new_picked.role.clone(),
-            name: new_picked.name.clone(),
-            cursor: OverlayCursor {
-                x: vibe_extract_core::ax_macos::current_cursor().x,
-                y: vibe_extract_core::ax_macos::current_cursor().y,
+        let _ = overlay.emit(
+            "overlay-hover",
+            OverlayHoverPayload {
+                bounds: Some(OverlayBounds {
+                    x: picked.bounds.x,
+                    y: picked.bounds.y,
+                    w: picked.bounds.w,
+                    h: picked.bounds.h,
+                }),
+                role: picked.role.clone(),
+                name: picked.name.clone(),
+                cursor: OverlayCursor { x: cursor.x, y: cursor.y },
             },
-        };
-        let _ = overlay.emit("overlay-hover", payload);
+        );
     }
+    log::info!(
+        "walk_hover_ancestry({}): now {} \"{}\" {:.0}x{:.0}",
+        if go_up { "up" } else { "down" },
+        picked.role, picked.name, picked.bounds.w, picked.bounds.h
+    );
+
+    // Background: capture the element's pixels, then back-fill crop_path into the
+    // selection IF it's still the same element (user hasn't navigated on). Never
+    // blocks the keypress.
+    let app_bg = app.clone();
+    let mut picked_for_crop = picked.clone();
+    tauri::async_runtime::spawn(async move {
+        capture_pick_crop(&app_bg, &mut picked_for_crop).await;
+        let Some(cp) = picked_for_crop.crop_path.clone() else {
+            return;
+        };
+        let list = {
+            let state = app_bg.state::<PickSessionState>();
+            let mut s = state.0.lock().unwrap();
+            match s.selected.last_mut() {
+                Some(last)
+                    if last.pid == picked_for_crop.pid
+                        && rects_match(&last.bounds, &picked_for_crop.bounds) =>
+                {
+                    last.crop_path = Some(cp);
+                    Some(s.selected.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(list) = list {
+            // Re-persist last-selection.json so `get_selection` now carries the crop.
+            let dir = app_bg.state::<OutputDir>().inner().0.clone();
+            if let Ok(js) = serde_json::to_string(&list) {
+                let _ = std::fs::write(dir.join("last-selection.json"), js);
+            }
+        }
+    });
     Ok(())
+}
+
+/// True when `inner` lies within `outer` AND is strictly smaller in some dimension
+/// (so a child genuinely descends). Used by ↓ to decide retrace vs first-child.
+fn rect_inside(
+    inner: &vibe_extract_core::capture::ScreenRect,
+    outer: &vibe_extract_core::capture::ScreenRect,
+) -> bool {
+    inner.x >= outer.x - 1.0
+        && inner.y >= outer.y - 1.0
+        && inner.x + inner.w <= outer.x + outer.w + 1.0
+        && inner.y + inner.h <= outer.y + outer.h + 1.0
+        && (inner.w < outer.w - 0.5 || inner.h < outer.h - 0.5)
+}
+
+/// Two rects are ~equal (within 2pt on every edge) — used to recognise the element
+/// we're currently ON among the ancestors of a centre hit-test.
+fn rects_match(
+    a: &vibe_extract_core::capture::ScreenRect,
+    b: &vibe_extract_core::capture::ScreenRect,
+) -> bool {
+    (a.x - b.x).abs() <= 2.0
+        && (a.y - b.y).abs() <= 2.0
+        && (a.w - b.w).abs() <= 2.0
+        && (a.h - b.h).abs() <= 2.0
+}
+
+/// Build a PickedElement from an AX element reached by tree navigation.
+#[cfg(target_os = "macos")]
+fn picked_from(
+    el: &vibe_extract_core::ax_macos::AxElement,
+    bounds: vibe_extract_core::capture::ScreenRect,
+) -> PickedElement {
+    let name = el
+        .str_attr("AXTitle")
+        .or_else(|| el.str_attr("AXDescription"))
+        .or_else(|| el.str_attr("AXLabel"))
+        .or_else(|| el.str_attr("AXValue"))
+        .unwrap_or_default();
+    let pid = el.pid().unwrap_or(-1);
+    PickedElement {
+        role: el.str_attr("AXRole").unwrap_or_default(),
+        subrole: el.str_attr("AXSubrole").filter(|s| !s.is_empty()),
+        name,
+        identifier: el.str_attr("AXIdentifier").filter(|s| !s.is_empty()),
+        bounds,
+        pid,
+        app_path: vibe_extract_core::ax_macos::pid_to_path(pid),
+        window_title: None,
+        window_bounds: el.enclosing_window().and_then(|w| w.rect()),
+        click: None,
+        ax_shallow: false,
+        crop_path: None,
+    }
+}
+
+/// Re-acquire the AX handle for the element we're currently ON. A centre hit-test
+/// returns the DEEPEST element at that point — NOT necessarily `current` (which may
+/// be a container we walked up to). So climb the hit element's ancestors until one's
+/// bounds match `current`: THAT is the node to navigate from. (Fixes level-jumping —
+/// previously we walked from the deepest leaf.)
+#[cfg(target_os = "macos")]
+fn reacquire_current(
+    target_pid: Option<i32>,
+    current: &PickedElement,
+) -> Option<vibe_extract_core::ax_macos::AxElement> {
+    let center = current.bounds.center();
+    let hit = |c| {
+        if let Some(pid) = target_pid {
+            vibe_extract_core::ax_macos::element_at_in_app(c, pid)
+        } else {
+            vibe_extract_core::ax_macos::element_at(c)
+        }
+    };
+    let mut el = hit(center)?;
+    for _ in 0..48 {
+        if matches!(el.rect(), Some(b) if rects_match(&b, &current.bounds)) {
+            return Some(el);
+        }
+        match el.parent() {
+            Some(p) => el = p,
+            None => break,
+        }
+    }
+    hit(center) // fallback: the deepest element at the centre
+}
+
+/// Step UP from the element we're on to the next genuinely-larger ancestor —
+/// skipping bounds-less / same-size WRAPPER nodes (AX noise) so each ↑ is one
+/// VISIBLE level — and treat the AXWindow as the top (whole window = the max).
+#[cfg(target_os = "macos")]
+fn ax_parent_of(
+    cur_el: &vibe_extract_core::ax_macos::AxElement,
+    current_bounds: &vibe_extract_core::capture::ScreenRect,
+    our_pid: i32,
+) -> Result<PickedElement, String> {
+    if cur_el.str_attr("AXRole").as_deref() == Some("AXWindow") {
+        return Err("already at the window (max)".into());
+    }
+    let mut p = cur_el.parent().ok_or("already at the top — can't go higher")?;
+    for _ in 0..48 {
+        let role = p.str_attr("AXRole").unwrap_or_default();
+        let pid = p.pid().unwrap_or(-1);
+        if pid == our_pid || role == "AXApplication" {
+            return Err("reached the application root".into());
+        }
+        if let Some(b) = p.rect() {
+            if b.w >= 1.0 && b.h >= 1.0 {
+                // A meaningful step up = strictly larger than current, OR the window.
+                if rect_inside(current_bounds, &b) || role == "AXWindow" {
+                    return Ok(picked_from(&p, b));
+                }
+            }
+        }
+        if role == "AXWindow" {
+            return Err("window has no usable bounds".into());
+        }
+        match p.parent() {
+            Some(pp) => p = pp,
+            None => return Err("reached the top".into()),
+        }
+    }
+    Err("no larger ancestor found".into())
+}
+
+/// First MEANINGFUL child of the element we're on (usable bounds, in the target
+/// app, strictly inside) — mouse-free, mirroring the web getFirstElementChild.
+#[cfg(target_os = "macos")]
+fn ax_first_child_of(
+    cur_el: &vibe_extract_core::ax_macos::AxElement,
+    current_bounds: &vibe_extract_core::capture::ScreenRect,
+    our_pid: i32,
+    target_pid: Option<i32>,
+) -> Result<PickedElement, String> {
+    for child in cur_el.array_attr("AXChildren") {
+        let Some(b) = child.rect() else { continue };
+        if b.w < 1.0 || b.h < 1.0 {
+            continue;
+        }
+        let pid = child.pid().unwrap_or(-1);
+        if pid == our_pid || (target_pid.is_some() && Some(pid) != target_pid) {
+            continue;
+        }
+        if !rect_inside(&b, current_bounds) {
+            continue;
+        }
+        return Ok(picked_from(&child, b));
+    }
+    Err("no child to descend into".into())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1732,6 +1928,36 @@ fn spawn_hover_task(app: AppHandle) {
                 let pt = vibe_extract_core::ax_macos::current_cursor();
                 if pt.x < 0.0 || pt.y < 0.0 {
                     continue;
+                }
+
+                // --- Frozen-app guard (WPS PDF etc.) ---------------------------
+                // While a picked app is SIGSTOP-frozen (so its hover panel stays
+                // open), skip hover tracking: a suspended app can't answer AX (the
+                // call would hang), and the committed selection stays outlined. The
+                // cursor still moves freely. Released on Esc/clear/stop.
+                if state.lock().unwrap().freeze_pid.is_some() {
+                    continue;
+                }
+
+                // --- Keyboard-nav freeze (web `isScrollNavigating`) -------------
+                // While the user is walking the tree via ↑/↓ and HASN'T moved the
+                // mouse, don't let the hover re-target — keep the navigated element
+                // highlighted/selected. The first real cursor move ends nav.
+                {
+                    let mut s = state.lock().unwrap();
+                    if s.nav_active {
+                        let moved = match s.nav_anchor_cursor {
+                            Some(a) => (pt.x - a.x).abs() > 4.0 || (pt.y - a.y).abs() > 4.0,
+                            None => true,
+                        };
+                        if moved {
+                            s.nav_active = false;
+                            s.nav_anchor_cursor = None;
+                            s.nav_stack.clear();
+                        } else {
+                            continue; // frozen — leave the navigated selection showing
+                        }
+                    }
                 }
 
                 // --- Electron: drive the highlight from the live DOM (CDP) ------
@@ -1920,6 +2146,7 @@ fn spawn_hover_task(app: AppHandle) {
                                         &b,
                                         pt,
                                         window_bounds.as_ref(),
+                                        el.child_count(),
                                     );
                                     s.last_hover = Some(PickedElement {
                                         role: role.clone(),

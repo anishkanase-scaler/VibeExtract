@@ -28,10 +28,15 @@ travels with the skill on any machine, with or without this repo:
 - `sprite.py` (`SpriteSlicer`) + `cache.py` (`SpriteCache`) — crop real pixels into deduped
   icon sprites (for AX / screenshot-only apps); `cache.py` is also the reuse-cache CLI.
 - `gridtext.py` (+ `vision_ocr.swift`) — baked grid labels → real text (AX→OCR→repair).
-- `catalog_extract.m` + `native_icons.py` — for **native AppKit apps** (Office, Finder, Mail…),
-  extract CLEAN transparent icons from the app's `Assets.car` (CoreUI), match each control to its
-  icon by name, and place it at the **measured native glyph box**. The right way to do native-app
-  icons (clean/scalable, no baked-in background) — see step 3b's native-app path.
+- `resource_extract.py` + `icon_match.py` — **THE icon picker (use this first).** `extract_pool(app)`
+  pulls the app's FULL real-icon set (qt `.rcc` / appkit `Assets.car` / electron / loose, auto-dispatch);
+  `icon_match.match(native_crop, pool, idx, name_prior=…)` then picks each control's icon by **VISUAL
+  silhouette match to the native pixels** (colour-invariant; name map only a prior), and `icon_map.json`
+  **LOCKS** confirmed picks so re-runs never regress them. This replaces name-only matching for ALL apps
+  (name-matching alone whack-a-moles). See step 3b.
+- `catalog_extract.m` + `native_icons.py` — AppKit `Assets.car` extractor (the appkit branch of
+  `extract_pool`) + `measure_glyph_box`/`trim`/`key_bg`. `native_icons.name_match` is now just a
+  name-PRIOR provider for `icon_match`, not the decider.
 
 Reference it **by the skill's base path**, e.g. `python3 "<skill-base>/_shared/cache.py" …`;
 below, `_shared/…` is shorthand for that. **There are no app-specific scripts to locate** — the
@@ -44,6 +49,38 @@ harvested `assets/`, screenshots/captures, sprite `cache/`, and any generator yo
 in **`.replicate-ui/<app>/`** in the current working directory. That folder is gitignored and
 fully regenerable: **deleting it loses nothing but caching speed.** The only thing that must
 persist is the skill (with its `_shared/`).
+
+## THE METHOD — the canonical pipeline for EVERY app (read this first)
+One method, every app — Office, WPS, Slack, Finder, Acrobat, Chess, any macOS app. **No per-app code.**
+Four pillars, always in this order; each links to its detailed step below. (Index across sessions:
+the master memory `[[replicate-ui-method]]`.)
+
+1. **Icons come from the app's OWN install bundle — never screenshots, never hand-drawn.** Locate the
+   install dir (`ps -p <pid> -o comm=` / `mdfind` / `/Applications/<App>.app`) and pull its FULL real-icon
+   set with `resource_extract.extract_pool(app_path)` (auto-dispatch: Qt `.rcc` / AppKit `Assets.car` /
+   Electron inline-SVG / loose). A screenshot crop is a per-icon LAST RESORT, only for a runtime-rendered
+   element with no resource file. → step 3b.
+2. **The LLM judges every icon and pixel-matches it to the native reference — then locks it.**
+   `icon_match.match(native_crop, pool, idx, name_prior=…, keywords=…)` ranks candidates by a
+   colour-invariant silhouette score — the native PIXELS decide, the name map only biases. THEN the
+   **LLM vision gate is a REQUIRED step**: view the native crop beside the top-k and confirm each pick
+   once by eye (shape + accent colours) — the score narrows but doesn't settle the final look (thin /
+   accent-only glyphs stay low-confidence). Lock every confirmed pick in `icon_map.json`
+   (`{resource,confirmed,crop_hash}`); re-runs FREEZE locked entries → never re-pick → no regression. → step 3b.
+3. **Build the DOM from the AX tree as a real, semantic frontend.** Drive every element from its AX role
+   through `markup.el_from_node(node, …)` (single choke point: role→tag via `role-map.json`, stamps
+   `data-ax-*`) → semantic tags, REAL focusable controls (`<button>`, `<input>`, `role=tab/slider/combobox`),
+   `interactive.css` for focus/hover, laid out as a NESTED normal-flow hierarchy (landmarks + flex/gap/
+   margin) that reads like a hand-written app — NOT a flat `position:absolute` div canvas. Use judgment to
+   make it look like a real frontend; carets are their OWN focusable elements, never glued into a label.
+   Flat absolute-div / sprite clones are the fallback ONLY when the AX tree is opaque (Electron-no-CDP,
+   CEF, SceneKit). → step 6.
+4. **Consolidate the learnings — load ONE method, not fragments.** Every cross-app law (fresh-crop-only
+   pixels, dev-picks-once auto-iteration, per-region acceptance gate, reconstruct-never-image, incremental
+   reuse, platform capture gotchas) is indexed from `[[replicate-ui-method]]`; the steps below and the
+   deep-dive memories carry the specifics.
+
+Everything after this section is the detailed loop that implements these four pillars.
 
 ## The golden rule: coordinates & scale
 - All AX bounds and screenshot inputs are in **points**, top-left origin.
@@ -144,21 +181,49 @@ persist is the skill (with its `_shared/`).
      **icons/SVGs/images** from this run's harvest, not a prior run's pixels.
    - If the target is **Electron without a debug port**, *offer* `relaunch_with_debug_port` to
      enable the harvest — do **not** fall back to drawing.
-   - For **native AppKit apps** (no CDP — Office, Finder, Mail, System Settings…), get CLEAN
-     transparent icons from the app's **compiled asset catalog** `Assets.car` — NOT screenshot
-     sprites (those bake in the ribbon background, can't scale, and break the layout). Use
-     `_shared/native_icons.py` + `_shared/catalog_extract`:
-     `find_catalogs(app_path)` → `build_pool(car,out)` → `load_pool(out, "normal_dark"|"normal")`,
-     then per control `name_match(ax_name, pool, extra=[known catalog name])`. **Match by NAME**
-     (AX name → catalog base, e.g. Bold→`ic_fluent_text_bold`, Columns→`TextColumnTwo`): exact →
-     keyword-narrow → visual-confirm. Blind visual search over thousands of icons picks the WRONG
-     one. **Screenshot-crop is the per-icon FALLBACK** only when no confident name match
-     (`key_bg(crop_region, bg)` → transparent). Place every icon at its **measured glyph box**
-     (step 6), using the **largest** rendition downscaled (crisp, not thick).
-   - **Exact-icon fallback:** if a *specific* icon isn't in the harvest's font/svg/image set, get
-     it exactly anyway — **crop its pixel region** from a `screenshot_region` of that element
-     (transparent-key the background), **or** read its **icon-font codepoint** and embed the
-     harvested woff2. Cropping a real glyph beats drawing one, every time.
+   - **Icon selection is VISUAL-MATCH-DRIVEN + LOCKED (use `icon_match`; name-matching alone
+     whack-a-moles).** Pipeline: `resource_extract.extract_pool(app_path)` → the app's full real-icon
+     pool; then per control `icon_match.match(native_crop, pool, idx, name_prior=<.kui/AX/data-qa>,
+     keywords=[…])` ranks candidates by **colour-invariant silhouette score** — the native PIXELS decide,
+     the name map only shortlists/biases (a clearly-better visual match wins). The model **confirms each
+     pick once** (native-vs-top-k grid) and it's **locked in `icon_map.json`** (`{resource,confirmed,
+     crop_hash}`); re-runs FREEZE locked entries → never re-pick → **no regression** (the root cause of
+     "fixed one, broke another" was global re-picking with no lock). Notes: render candidate masks via
+     BATCHED `qlmanage` (use luma, not alpha — qlmanage paints an opaque white bg); CAP the keyword
+     shortlist (substring `"line"` → 1000+ candidates). Thin/accent-only glyphs stay low-confidence → the
+     model's eye on the top-k. This is HOW you pick from the real resources below:
+   - **For ANY native app (no CDP — Office, Finder, WPS, Mail, System Settings…) the icons are REAL
+     resource files inside the app's INSTALL BUNDLE. Extract those. A screenshot crop is a LAST
+     RESORT, never the default.** 🚫 Do NOT screenshot-crop an icon when its real file exists — a
+     scaled screenshot crop is small/blurry/dim and bakes in the background (this was a flagged
+     mistake). For a NEW app, FIRST find where it's installed (`ps -p <pid> -o comm=` /
+     `mdfind`/`/Applications/<App>.app`); its icons live under one resource tree. Check, in order:
+       • **AppKit** (Office, Finder, Apple apps): compiled catalog **`Assets.car`** via
+         `_shared/native_icons.py`+`catalog_extract`: `find_catalogs(app_path)`→`build_pool(car,out)`→
+         `load_pool(out,"normal_dark"|"normal")`. `name_match(ax_name,pool,extra=[catalog name])` supplies
+         only the NAME PRIOR — `icon_match` still DECIDES by pixels (pillar 2); this holds for AppKit too.
+       • **Qt / Kingsoft / cross-platform (WPS & many others): Qt resource bundles `*.rcc`/`*.qrc`**
+         (e.g. WPS `…/Contents/Resources/office6/mui/default/prometheus_kso_res.rcc`,
+         `…/skins/<active-theme>/default/*.rcc`). Parse the `qres` format directly: header magic
+         `qres`, u32 version/tree_off/data_off/name_off; v2 = fixed 22-byte tree nodes (name u32, flags
+         u16[1=zlib,2=dir]; dir→child_count/child_idx; file→…/data_off u32 @+10; +u64 mtime); names
+         `[u16 len][u32 hash][utf-16BE]`; data `[u32 len][bytes]` (usually UNCOMPRESSED svg/png; zlib via
+         `zlib.decompress(b[4:])` iff flag&1). Walk tree→`{path:bytes}`, match the command name
+         (`/icons_svg/24x24/FormatPainter.svg`,`Shapes.svg`,`Fill.svg`,`OutLine.svg`,`ShapeEffect.svg`,
+         `Group.svg`,`BringForward.svg`,`SelectObjects.svg`…).
+       • **Loose files**: `Contents/Resources/**` png/svg/`.icns` dirs, theme/skin folders.
+     **Prefer SVG** (vector → crisp at the measured size). Theme-aware vectors keep the glyph colour in
+     a `<style>` class (`.colorBlackStroke{fill:#333840}` / kdesign `var(--kd-color-icon-primary,#333333)`)
+     with accents in sibling classes (`.colorOrangeStroke #DC5513`, blues). **Recolour the monochrome
+     glyph to the theme** (dark bar → light grey ~native sample) and KEEP accents; for a control native
+     draws fully monochrome, force every colour grey. Replace `#333333` BEFORE `#333` (substring trap),
+     and replace `currentColor`/CSS-var fallbacks — when used via `<img src>` the colour MUST be baked
+     into the file (it can't inherit). Place each icon at its **measured glyph box** (step 6).
+   - **Screenshot-crop = per-icon LAST RESORT**, only when an element genuinely has NO resource file —
+     a *runtime-rendered/dynamic* preview (WPS's "Abc" shape-style thumbnails, a slide thumbnail, an
+     avatar). Then crop the real pixels (`key_bg`/transparent-key) — never hand-draw — and SAY in the
+     report that you cropped it and why no resource existed. Icon-font apps: read the codepoint + embed
+     the harvested woff2.
 
    On the harvest itself: `extract_assets { }` pulls assets straight from the live renderer via CDP
    (works even when the app isn't frontmost). It writes files under
@@ -245,6 +310,12 @@ persist is the skill (with its `_shared/`).
      • `AXPopUpButton` (a value box like Word's citation **Style: [APA]**) → an **up/down double
        chevron** `⌃⌄` on the right INSIDE the box (`native_icons.popup_spinner()`), NOT a single caret.
      • `AXButton`/`AXCheckBox` → NONE. Never guess.
+     • **A caret is its OWN element, NEVER a character glued into the label string.** Emit it as a
+       separate clickable/focusable component — `<span class="caret" role="button" aria-haspopup="menu"
+       data-ax-role="AXMenuButton" tabindex="0">⌄</span>` (like Excel's separate `caretbtn`) — so it is
+       an individual control, not text. Writing `f"{label} ⌄"` is WRONG (flagged by the dev). The split
+       button itself carries `aria-haspopup`. Inline `_shared/interactive.css` so every `role=button`/
+       caret gets cursor/hover/focus. This holds for ALL apps.
    - **Render what the native DRAWS, not the AX name.** A control's AX name is a label, not its visual:
      e.g. the citation-style popup is named `"Style:"` but Word draws the `SelectBibliographyStyle`
      book+brush ICON before the box, with no "Style:" text — so place the icon, not the literal name.
@@ -259,9 +330,8 @@ persist is the skill (with its `_shared/`).
    - **Steppers (`AXIncrementor`)** = label + bordered value box (value from the AX `value`) + up/down
      arrows + the small inline indicator icon (crop it from the native). Render **group sub-labels**
      (`AXStaticText`) at their AX positions; align labels + boxes in columns under their header.
-   - **NEVER hand-draw ANY control — Share/accent buttons included.** Sample its exact fill colour
-     from the crop and use the REAL glyph (extract `ic_fluent_share` etc.). Share was wrong twice
-     (Excel green `#3e8745`, Word blue `#3d6ede`) precisely because it was hand-drawn.
+   - **Share/accent buttons obey the no-hand-draw rule (3b):** sample the exact fill from the crop +
+     use the REAL glyph (`ic_fluent_share` etc.) — wrong twice when drawn (Excel `#3e8745`, Word `#3d6ede`).
 
    **Lay it out as a NESTED HIERARCHY in NORMAL FLOW — not a flat `position:absolute`
    canvas.** Emit real landmark containers (`<header>`/`<nav>`/`<aside>`/`<main>`/
@@ -317,6 +387,26 @@ persist is the skill (with its `_shared/`).
    that residual red is *text*, not a defect. So don't chase the number; confirm in the stacked view
    that **icons, colours, chevrons, and positions** all match, region by region.
 
+8a. **PER-REGION ACCEPTANCE GATE (HARD — overrides the SSIM stop).** The stacked/zoom check above is
+   NOT advisory. Before any region is "done" it must pass all three *sampled* checks. "SSIM is
+   text-capped / diminishing returns" (step 9) is a stop ONLY for residual **text** antialiasing — it
+   NEVER excuses a size, colour, or decoration defect. For EVERY control in the region:
+   1. **Icon size — measured, not fixed.** Each icon's box comes from `native_icons.measure_glyph_box`
+      (or an equal bright-pixel tight bbox); tight-crop/trim so the glyph FILLS its box (a padded crop
+      shrinks+dims the glyph under `object-fit:contain`; a real SVG must be sized to the measured glyph,
+      not its padded viewBox). Re-measure the glyph in the REPLICA render; it must match native within
+      **±2-3px** in w and h. A fixed-size, padded, or wrong-coloured (invisible→tiny) icon is a FAIL.
+   2. **Colour parity — sample BOTH sides.** `sample_color` the SAME point on the native crop AND the
+      replica render for every label, fill (incl. gap/container bg), colour-indicator bar, border, and
+      selection/active state; assert per-channel |Δ| ≤ **12**; record native-vs-replica hex. Over
+      tolerance ⇒ fix the sampled constant (don't eyeball) ⇒ FAIL. (Tip: small text on a dark bg
+      renders dim under `-webkit-font-smoothing:antialiased`; drop it to match native brightness.)
+   3. **Decoration enumeration.** List EVERY decoration native draws (underlines, *bordered* colour
+      bars, selection borders, chevrons `⌄` vs `⌃⌄`, dividers, badges) and confirm each is reproduced
+      (present, placed, colour within ±12). A native decoration with no replica counterpart is a FAIL.
+   Report per region: icons measured (max px Δ), colour samples (count, max channel Δ), decorations
+   (found / reproduced). Only after all three pass for every region do step 9's stop criteria apply.
+
 9. **Iterate — YOURSELF, to the bar. The dev picks once and never iterates.** If `pass` is false
    (score < 0.92): inspect the heatmap, fix the HTML/CSS for the highlighted regions, re-render,
    re-diff. **Run EVERY iteration autonomously** — re-sampling colours, re-slicing sprites, and
@@ -329,6 +419,8 @@ persist is the skill (with its `_shared/`).
    - `score ≥ 0.92` (pass), **or**
    - **6 iterations** on this component, **or**
    - two consecutive iterations improve `score` by **< 0.005** (diminishing returns).
+   - **Gate precondition:** none of these stops apply until **8a passes** for the region — a
+     size/colour/decoration FAIL is never "diminishing returns" or "text-capped."
    Report the final score per component; never silently accept a low score — but reaching the stop
    condition is YOUR call to make and report, not a question to bounce to the dev.
 

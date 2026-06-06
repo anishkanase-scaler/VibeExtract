@@ -260,6 +260,9 @@ async fn extract_at_viewport_inner(
         html,
         screenshot_png_b64: None,
         diagnostics: vec![],
+        // CDP captures the live DOM, not a macOS AX node tree → no structured
+        // AX tree to emit (the UI surfaces this as "(none)").
+        ax_tree: None,
     })
 }
 

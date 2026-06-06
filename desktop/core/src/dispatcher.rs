@@ -350,6 +350,7 @@ pub async fn extract_multi_with_opts(
     let primary_fidelity = per_element[0].1.fidelity.clone();
     let merged_toon = merge_toon(&per_element);
     let merged_html = merge_html(&per_element);
+    let merged_ax_tree = merge_ax_tree(&per_element);
     let merged_diag: Vec<String> = per_element
         .iter()
         .enumerate()
@@ -368,7 +369,35 @@ pub async fn extract_multi_with_opts(
         html: merged_html,
         screenshot_png_b64: per_element[0].1.screenshot_png_b64.clone(),
         diagnostics: merged_diag,
+        ax_tree: merged_ax_tree,
     })
+}
+
+/// Combine each picked element's AX tree into one JSON array — `[{element, role,
+/// name, ax_tree}, …]` — so a multi-element capture stays a single structured
+/// spec. Returns `None` when no element had an AX tree (honest, not a fake `[]`).
+fn merge_ax_tree(items: &[(PickedElement, CaptureResult)]) -> Option<String> {
+    if items.iter().all(|(_, r)| r.ax_tree.is_none()) {
+        return None;
+    }
+    let arr: Vec<serde_json::Value> = items
+        .iter()
+        .enumerate()
+        .map(|(i, (p, r))| {
+            let tree = r
+                .ax_tree
+                .as_ref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "element": i + 1,
+                "role": p.role,
+                "name": p.name,
+                "ax_tree": tree,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::Value::Array(arr)).ok()
 }
 
 fn merge_toon(items: &[(PickedElement, CaptureResult)]) -> String {
@@ -633,5 +662,8 @@ async fn native_extract_macos(
         html,
         screenshot_png_b64: Some(png_b64),
         diagnostics: diag,
+        // The serialized AX tree — same `Node` the MCP `ax_tree` tool returns.
+        // This is the structured semantic spec; the TOON above is its text form.
+        ax_tree: serde_json::to_string_pretty(&node).ok(),
     })
 }
