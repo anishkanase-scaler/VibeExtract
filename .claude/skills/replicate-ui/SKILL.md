@@ -20,11 +20,18 @@ There is **ONE common toolkit, no per-app code.** It ships *inside this skill* a
 `_shared/` (the **Base directory for this skill** shown at the top of this prompt) — so it
 travels with the skill on any machine, with or without this repo:
 - `role-map.json` + `markup.py` — AX/ARIA role → semantic HTML tag/attrs (`markup.role_el`,
-  `markup.el`, `markup.attrs_str`).
+  `markup.el`, `markup.attrs_str`); **`markup.el_from_node(node, …)`** builds an element from an AX
+  node AND stamps `data-ax-*` (role/name/bounds/id) so the HTML carries the AX tree (step 6).
+- `axtree_view.html` — standalone collapsible viewer for an extraction's `ax_tree.json`; copy it into
+  the output dir as `ax_tree.html` (step 10).
 - `interactive.css` — the button/input reset + hover/focus/active.
 - `sprite.py` (`SpriteSlicer`) + `cache.py` (`SpriteCache`) — crop real pixels into deduped
   icon sprites (for AX / screenshot-only apps); `cache.py` is also the reuse-cache CLI.
 - `gridtext.py` (+ `vision_ocr.swift`) — baked grid labels → real text (AX→OCR→repair).
+- `catalog_extract.m` + `native_icons.py` — for **native AppKit apps** (Office, Finder, Mail…),
+  extract CLEAN transparent icons from the app's `Assets.car` (CoreUI), match each control to its
+  icon by name, and place it at the **measured native glyph box**. The right way to do native-app
+  icons (clean/scalable, no baked-in background) — see step 3b's native-app path.
 
 Reference it **by the skill's base path**, e.g. `python3 "<skill-base>/_shared/cache.py" …`;
 below, `_shared/…` is shorthand for that. **There are no app-specific scripts to locate** — the
@@ -119,6 +126,14 @@ persist is the skill (with its `_shared/`).
    `relaunch_with_debug_port { bundle_id, display_name, confirm: true }` first
    (this quits & reopens the app — only with the user's OK).
 
+   **SAVE THE AX TREE — it's a deliverable, not scratch.** Write the `ax_tree` result
+   verbatim to `.replicate-ui/<app>/ax_tree.json` (pretty JSON). In **component mode**
+   (2b), save each picked element's `ax_subtree_at_point` result — either one file or a
+   JSON array `[{element, role, name, ax_tree}, …]`. This file is the **canonical
+   semantic spec** of the UI (every control's role/name/value/bounds/children); the
+   replica's HTML carries the same data inline (step 6), and `ax_tree.html` (step 10)
+   renders it. (No AX tree for pure-CDP/Electron captures — that's honest; don't fake one.)
+
 3b. **Harvest real assets — ALWAYS (do this every run).** 🚫 **Real assets are mandatory.
    NEVER hand-draw, approximate, or substitute an icon, image, avatar, or font.** Every one of
    them in the replica MUST come from a harvest (`extract_assets`) or the reuse cache — this is
@@ -129,9 +144,17 @@ persist is the skill (with its `_shared/`).
      **icons/SVGs/images** from this run's harvest, not a prior run's pixels.
    - If the target is **Electron without a debug port**, *offer* `relaunch_with_debug_port` to
      enable the harvest — do **not** fall back to drawing.
-   - For **native (AX) apps** (no CDP), icons come from per-element screenshot **sprites**
-     (`screenshot_region` slices / `_shared/cache.py: SpriteCache`) — sliced from real pixels,
-     never drawn.
+   - For **native AppKit apps** (no CDP — Office, Finder, Mail, System Settings…), get CLEAN
+     transparent icons from the app's **compiled asset catalog** `Assets.car` — NOT screenshot
+     sprites (those bake in the ribbon background, can't scale, and break the layout). Use
+     `_shared/native_icons.py` + `_shared/catalog_extract`:
+     `find_catalogs(app_path)` → `build_pool(car,out)` → `load_pool(out, "normal_dark"|"normal")`,
+     then per control `name_match(ax_name, pool, extra=[known catalog name])`. **Match by NAME**
+     (AX name → catalog base, e.g. Bold→`ic_fluent_text_bold`, Columns→`TextColumnTwo`): exact →
+     keyword-narrow → visual-confirm. Blind visual search over thousands of icons picks the WRONG
+     one. **Screenshot-crop is the per-icon FALLBACK** only when no confident name match
+     (`key_bg(crop_region, bg)` → transparent). Place every icon at its **measured glyph box**
+     (step 6), using the **largest** rendition downscaled (crisp, not thick).
    - **Exact-icon fallback:** if a *specific* icon isn't in the harvest's font/svg/image set, get
      it exactly anyway — **crop its pixel region** from a `screenshot_region` of that element
      (transparent-key the background), **or** read its **icon-font codepoint** and embed the
@@ -200,6 +223,46 @@ persist is the skill (with its `_shared/`).
    This is **platform-agnostic** — drive it from the role, never special-case per
    app. Static clone: set `aria-selected`/`aria-pressed` at build time; no JS.
 
+   **Stamp the AX tree onto the markup (`data-ax-*`).** Every element you emit from an AX node
+   must carry its semantics inline: `data-ax-role`, `data-ax-name`, `data-ax-bounds` (+
+   `data-ax-id` / `data-ax-value` / `data-ax-subrole` when present). Don't hand-write these —
+   build the element with **`markup.el_from_node(node, inner=…, cls=…, style=…)`** (the single
+   choke point: it stamps `data-ax-*` then maps role→tag via `role-map.json`). This makes the HTML
+   self-describing (the *code* contains the AX tree, matching `ax_tree.json`) and lets a viewer
+   overlay/inspect controls. The bar: every node-derived element carries `data-ax-*`.
+
+   **Native-app pixel-perfect rules (learned from Office ribbons — apply every time, no prompting):**
+   - **Measured glyph box, NEVER a fixed square.** Place each icon at the exact (x,y,w,h) measured
+     from the native crop (`native_icons.measure_glyph_box`), not a hardcoded 32×32. Native glyphs
+     vary in size/aspect (e.g. a wide ~39×28 Margins icon); forcing a square mis-sizes + shifts the
+     whole row — this was THE layout-broken root cause. (Screenshot sprites never had it because the
+     sprite *was* the exact pixel block at the exact position.)
+   - **Crisp, not thick:** use the LARGEST catalog rendition and downscale to the measured box; never
+     upscale a small rendition (→ blurry/thick strokes).
+   - **Dropdown indicators from the AX role — and there are TWO kinds, don't conflate them:**
+     • `AXMenuButton`/`AXComboBox` → a **single** down caret `⌄` (`native_icons.caret_for`), to the
+       RIGHT of the icon (tall buttons) or after the label (row buttons).
+     • `AXPopUpButton` (a value box like Word's citation **Style: [APA]**) → an **up/down double
+       chevron** `⌃⌄` on the right INSIDE the box (`native_icons.popup_spinner()`), NOT a single caret.
+     • `AXButton`/`AXCheckBox` → NONE. Never guess.
+   - **Render what the native DRAWS, not the AX name.** A control's AX name is a label, not its visual:
+     e.g. the citation-style popup is named `"Style:"` but Word draws the `SelectBibliographyStyle`
+     book+brush ICON before the box, with no "Style:" text — so place the icon, not the literal name.
+     When AX gives a name that the UI shows as an icon, find + place that icon (catalog or crop).
+   - **Verify each icon's GLYPH, not just its position.** A name match can be the right name but the
+     WRONG glyph: catalog `InsertCitation` is a page with `(−)`+check, but Mac Word draws a scroll with
+     green `+`/red `−`. In the stacked view (step 8) ZOOM into every icon and compare SHAPE + accent
+     COLOURS; when the catalog glyph differs from native, force that control to a screenshot **crop**
+     (`["CROP"]` sentinel) — the guaranteed-exact fallback. (Automated glyph cross-correlation is too
+     noisy to gate on — it scores correct matches as low as wrong ones; rely on the zoomed stacked check.)
+   - **Disabled/greyed controls → reduced opacity** (~0.4) when the native shows them dimmed.
+   - **Steppers (`AXIncrementor`)** = label + bordered value box (value from the AX `value`) + up/down
+     arrows + the small inline indicator icon (crop it from the native). Render **group sub-labels**
+     (`AXStaticText`) at their AX positions; align labels + boxes in columns under their header.
+   - **NEVER hand-draw ANY control — Share/accent buttons included.** Sample its exact fill colour
+     from the crop and use the REAL glyph (extract `ic_fluent_share` etc.). Share was wrong twice
+     (Excel green `#3e8745`, Word blue `#3d6ede`) precisely because it was hand-drawn.
+
    **Lay it out as a NESTED HIERARCHY in NORMAL FLOW — not a flat `position:absolute`
    canvas.** Emit real landmark containers (`<header>`/`<nav>`/`<aside>`/`<main>`/
    `<section>`) and place children with flexbox + normal flow (`display:flex`, `gap`,
@@ -234,12 +297,25 @@ persist is the skill (with its `_shared/`).
 
 7. **Render.** Via the `playwright` MCP:
    - `browser_resize { width: point_w, height: point_h }`
-   - `browser_navigate { url: "file:///abs/path/to/replica.html" }`
+   - `browser_navigate { url: "file:///abs/path/to/replica.html" }` — if this errors with
+     "Access to file: protocol is blocked", serve the dir (`python3 -m http.server` in the output
+     folder, run in the background) and navigate to `http://127.0.0.1:<port>/index.html` instead.
    - `browser_take_screenshot { filename: "replica-<component>.png" }` → note the saved path.
 
-8. **Verify.** `compare_images { a_path: <native crop path>, b_path: <replica path> }`.
-   Read `score` (0..1) and look at the returned **diff heatmap** (bright red = where
-   they differ).
+8. **Verify — `compare_images` PLUS a STACKED pixel comparison (required; do not skip).**
+   `compare_images { a_path: <native crop>, b_path: <replica> }` → read `score` and the red diff
+   **heatmap**. THEN also build a **stacked image — native on top, replica directly below at the same
+   width — and look at it**, plus **per-region crops** of every busy area (each icon group). **Zoom
+   into EVERY icon and compare its GLYPH — shape + accent colours + which dropdown indicator (single
+   `⌄` vs up/down `⌃⌄`)** — not just whether something sits in the right place. The stacked view is how
+   you actually catch the errors the dev would otherwise flag (wrong icon, wrong glyph under a right
+   name, mis-sized icon, single-caret-vs-spinner, AX-name-as-text instead of the drawn icon, misaligned
+   label/box) — the number alone won't. When a glyph differs, crop it (`["CROP"]`) and re-verify.
+   **Judge LAYOUT by alignment, not the score:** where icons/shapes land ON the native they go
+   **dark** in the heatmap = aligned. **SSIM is TEXT-CAPPED:** on label-dense UI (ribbons) real-text
+   labels (browser vs native font AA) hold the score ~0.55–0.75 even when the layout is pixel-exact —
+   that residual red is *text*, not a defect. So don't chase the number; confirm in the stacked view
+   that **icons, colours, chevrons, and positions** all match, region by region.
 
 9. **Iterate — YOURSELF, to the bar. The dev picks once and never iterates.** If `pass` is false
    (score < 0.92): inspect the heatmap, fix the HTML/CSS for the highlighted regions, re-render,
@@ -259,7 +335,19 @@ persist is the skill (with its `_shared/`).
 10. **Compose & final-verify.** Assemble verified components into the full page at
     the window's point size, render, and `compare_images` against the
     `screenshot_window` shot. Report the final whole-window score and write the
-    final `index.html`.
+    final `index.html`. **Then make the folder a complete spec:** ensure
+    `ax_tree.json` is present (step 3) and copy `_shared/axtree_view.html` →
+    `.replicate-ui/<app>/ax_tree.html` (it loads `ax_tree.json` and renders the
+    collapsible tree). Deliverable = `index.html` (visual + `data-ax-*`) +
+    `ax_tree.json` (canonical spec) + `ax_tree.html` (viewer).
+
+    **Show it IN THE APP, not at a URL.** Call the `show_replica { dir: "<abs path to
+    .replicate-ui/<app>/" }` MCP tool — it loads `index.html` (assets auto-inlined) +
+    `ax_tree.json` into the VibeExtract app's result panel (Preview / HTML / AX Tree
+    tabs) and brings the window forward. This is the user-facing preview; do NOT spin up
+    `python3 -m http.server` or hand the user a `localhost` URL. (Playwright + a local
+    file/server are still fine as YOUR private render target for the `compare_images`
+    verify loop — just don't surface a URL as the deliverable.)
 
 11. **Pre-done asset check (REQUIRED — do not skip).** Before you report the replica as done,
     audit the markup: **every icon, avatar, image, and font must be a real harvested asset** (from
@@ -272,12 +360,27 @@ persist is the skill (with its `_shared/`).
     or colour is wrong. If anything is still approximate, fix it (harvest/crop/re-sample) before
     declaring done.
 
+    **AX-tree deliverables (REQUIRED too):** confirm `.replicate-ui/<app>/ax_tree.json` exists and
+    equals the `ax_tree` MCP output, `ax_tree.html` is present, and every node-derived element in
+    `index.html` carries `data-ax-*` (built via `markup.el_from_node`). The output is a complete
+    semantic spec — visual + structure — not just a picture.
+
+    **You may only say "done" after the STACKED native-over-replica comparison (step 8) passes your
+    eye region-by-region.** For native-app replicas, that audit explicitly confirms: every icon came
+    from the catalog (or a real crop) and sits at its **measured glyph box**; **chevrons exactly match
+    the AX roles** (AXMenuButton only); greyed/disabled states are dimmed; steppers/sub-labels align in
+    columns; the Share/accent button uses the **real glyph + sampled colour** (never hand-drawn). The
+    bar is that the dev never has to point out a layout, icon, chevron, or colour mistake — catch them
+    yourself in the stacked view first.
+
 ## vibe-extract tools (reference)
 `check_ax_permission`, `request_ax_permission`, `frontmost_app`, `list_windows`,
 `ax_tree`, `ax_node_at_point`, `ax_subtree_at_point`, `screenshot_region`,
 `screenshot_window`, `sample_color`, `color_palette`, `relaunch_with_debug_port`
 (destructive — needs `confirm:true`), `extract_component`, `extract_assets`
-(real fonts/icons/images via CDP → local files + manifest), `compare_images`.
+(real fonts/icons/images via CDP → local files + manifest), `compare_images`,
+`show_replica` (load a finished extraction folder into the app's result panel —
+the in-app preview; use instead of serving a URL).
 
 ## Notes
 - Prefer `ax_tree` node `bounds` → `screenshot_region` for pixel-tight crops over

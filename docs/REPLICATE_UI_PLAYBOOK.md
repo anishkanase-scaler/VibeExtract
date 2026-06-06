@@ -359,3 +359,38 @@ reports "first page, full cost" and populates the cache as it goes.
 - **Low `compare_images` score on a good replica** — you probably rendered at
   device pixels; render at **point** size and let the diff resize.
 - **Playwright hangs on first run** — run `npx playwright install chromium`.
+
+## Native AppKit apps: clean icons from `Assets.car` (Office ribbons — the right way)
+
+A native AppKit app (Office, Finder, Mail, System Settings) is the **fourth case** (beyond AX-rich
+DOM, Electron/CDP, and AX-opaque screenshot-only). Its toolbar/ribbon icons live in the app's
+**compiled asset catalog** `Assets.car`. Extract them CLEAN + transparent instead of cropping
+screenshot sprites (which bake in the background, can't scale, and — if mis-sized — break the layout).
+Tools: `_shared/catalog_extract.m` (CoreUI `Assets.car` → transparent PNGs) + `_shared/native_icons.py`.
+
+Worked pipeline (proven on Excel **Insert** and Word **Layout** ribbons):
+1. **Inventory from AX** — every control's `name`, `role`, `bounds`. The role is authoritative for
+   chevrons: `AXMenuButton` → dropdown caret; `AXButton`/`AXCheckBox` → none (`native_icons.caret_for`).
+   `AXIncrementor` → a stepper (label + value box + arrows + small inline indicator icon).
+2. **Extract the pool** — `find_catalogs(app_path)` (Office ribbon icons are in the ~22 MB
+   `mso40ui.framework/.../Assets.car`), `build_pool(car, out)`, `load_pool(out, "normal_dark")` for a
+   dark UI (`"normal"` for light) → `{ base-name → largest-rendition png }`.
+3. **Match by NAME** — `name_match(ax_name, pool, extra=[known catalog name])`: exact → keyword-narrow
+   → visual-confirm. AX name → catalog base, e.g. Bold→`ic_fluent_text_bold`, Columns→`TextColumnTwo`,
+   Margins→`UxGalPageMargins`, Share glyph→`ic_fluent_share`. **Blind visual search over thousands of
+   icons picks the wrong one** (it once chose a "BriefCase" blob and the spreadsheet-columns glyph).
+   No confident match → **screenshot-crop fallback** (`key_bg(crop, bg)` → transparent).
+4. **Place at the MEASURED glyph box** — `measure_glyph_box(crop, button_box, kind)` gives each icon's
+   exact (x,y,w,h) from the native crop. Place the icon there; **never a fixed 32×32 square** (native
+   glyphs vary, e.g. a wide ~39×28 Margins icon — a square mis-sizes/shifts the whole row). Use the
+   **largest** rendition downscaled = crisp, not thick.
+5. **States & chrome** — greyed/disabled controls at ~0.4 opacity; group sub-labels (`AXStaticText`)
+   and stepper labels/boxes aligned in columns under their header. **Never hand-draw the Share/accent
+   button** — sample its exact fill (Excel green `#3e8745`, Word blue `#3d6ede`) and use the real glyph.
+6. **Verify with a STACKED native-over-replica image + per-region crops**, not just the number. Aligned
+   icons go **dark** in the heatmap. **SSIM is text-capped** (~0.55–0.75) on label-dense ribbons because
+   real-text labels differ from native font AA — that residual red is text, not a layout bug. Judge
+   layout by alignment in the stacked view; only declare done once it passes region-by-region.
+
+Reference scratch: `.replicate-ui/excel-insert/build_insert.py`, `.replicate-ui/word-ribbon/build_word.py`
+(throwaway generators that import the toolkit — the method, not per-app code).
