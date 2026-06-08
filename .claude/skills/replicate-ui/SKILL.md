@@ -199,7 +199,13 @@ Everything after this section is the detailed loop that implements these four pi
      "fixed one, broke another" was global re-picking with no lock). Notes: render candidate masks via
      BATCHED `qlmanage` (use luma, not alpha — qlmanage paints an opaque white bg); CAP the keyword
      shortlist (substring `"line"` → 1000+ candidates). Thin/accent-only glyphs stay low-confidence → the
-     model's eye on the top-k. This is HOW you pick from the real resources below:
+     model's eye on the top-k. 🚫 **A LOW match score is NEVER a reason to screenshot-crop the glyph.**
+     When `icon_match` scores low (thin/small/dark-theme icons routinely do), DON'T fall back to a crop —
+     **grep the pool basenames by the command name** and DIRECT-MAP control→basename (PDF apps: almost all
+     `Pdf_*`; themed app icons end `_kd`), then eyeball native-vs-candidate to confirm the exact glyph
+     (e.g. WPS-PDF "Shapes" draws a *line* → `DrawLine`; "Note" is a bubble+plus → `bubble_add_kd`). The
+     visual score is a tie-breaker, not the decider. See [[replicate-ui-real-icons-first-never-screenshot]].
+     This is HOW you pick from the real resources below:
    - **For ANY native app (no CDP — Office, Finder, WPS, Mail, System Settings…) the icons are REAL
      resource files inside the app's INSTALL BUNDLE. Extract those. A screenshot crop is a LAST
      RESORT, never the default.** 🚫 Do NOT screenshot-crop an icon when its real file exists — a
