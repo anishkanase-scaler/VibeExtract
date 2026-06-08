@@ -537,6 +537,7 @@ pub async fn extract_frontmost_window_with_opts(
             click: None,
             ax_shallow: false,
             crop_path: None,
+            ax_tree: None,
         }
     };
 

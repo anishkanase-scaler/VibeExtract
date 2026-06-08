@@ -64,6 +64,22 @@ def _ink_from_rgba(im):
     return _binarize(ink)
 
 
+def _inline_css_vars(svg_bytes):
+    """qlmanage can't resolve CSS custom properties, so theme-templated SVGs (kdesign '_kd':
+    fill:var(--kd-color-icon-primary,#333333) / currentColor) render BLANK on its white bg — an
+    empty silhouette → a useless mask whose score collapses to ~0.2-0.3 regardless of correctness.
+    Inline each var()'s fallback colour and give currentColor a visible value so the glyph actually
+    paints. Best-effort; on any error the caller keeps the original bytes."""
+    try:
+        s = svg_bytes.decode("utf-8", "ignore")
+        s = re.sub(r"var\(\s*--[^,)]+,\s*([^)]+)\)", r"\1", s)   # var(--x, #fff) -> #fff
+        s = re.sub(r"var\(\s*--[^)]+\)", "#333333", s)           # var(--x) (no fallback) -> dark
+        s = s.replace("currentColor", "#333333")
+        return s.encode("utf-8")
+    except Exception:
+        return svg_bytes
+
+
 def normalize(binary, size=64, blur=1.2):
     """binary glyph -> tight-crop -> resize size×size -> soft mask (alignment/AA tolerant)."""
     bb = binary.getbbox()
@@ -114,7 +130,7 @@ def render_masks(pool, keys, size=64, cache_dir="cache/masks", blur=1.2, batch=1
                 m.save(cp); out[k] = m
             else:
                 sp = os.path.join(td, h + ".svg")
-                open(sp, "wb").write(b)
+                open(sp, "wb").write(_inline_css_vars(b))   # paint theme-templated _kd icons
                 svg_jobs.append((k, h, cp, sp))
         for i in range(0, len(svg_jobs), batch):          # batched qlmanage
             chunk = svg_jobs[i:i + batch]
@@ -167,9 +183,129 @@ def match(native_crop, pool, pool_idx, name_prior=None, keywords=None,
     for k, m in masks.items():
         s = score(nat, m)
         is_prior = rx.basename(k) in prior_bases if rx else False
-        ranked.append((k, s, s + (prior_boost if is_prior else 0.0), is_prior))
+        # Adaptive boost: only let the name-prior break ties among candidates with REAL signal.
+        # A blank/near-zero mask (e.g. a render that still failed) must not be boosted into winning.
+        boost = prior_boost if (is_prior and s >= 0.40) else 0.0
+        ranked.append((k, s, s + boost, is_prior))
     ranked.sort(key=lambda r: -r[2])                        # sort by biased score
     return [(k, round(s, 3), p) for (k, s, _b, p) in ranked[:topk]]
+
+
+# ---------------------------------------------------------------- color-aware rendered-icon GATE
+# The mask scorer above is COLOUR-BLIND (it binarises to a silhouette) and whole-strip SSIM is
+# alignment-dominated — so BOTH miss a wrong body colour (e.g. a document painted in the accent
+# colour instead of grey) or a wrong accent. This gate closes that hole: it compares the FINAL
+# rendered icon (native crop vs replica crop) on BOTH shape AND sampled body/accent colour. Run it
+# on every placed icon and DON'T stop until each passes — this is the "separate icon accuracy
+# predictor" the dev asked for, and the regression-catcher the recolour step needs behind it.
+def _hsv(p):
+    import colorsys
+    return colorsys.rgb_to_hsv(p[0] / 255.0, p[1] / 255.0, p[2] / 255.0)
+
+
+def _median_rgb(pixels):
+    if not pixels:
+        return None
+    return tuple(sorted(p[c] for p in pixels)[len(pixels) // 2] for c in range(3))
+
+
+def dominant_accent(crop, min_sat=0.30, min_val=0.25, core_frac=0.4):
+    """The accent colour's CORE as (r,g,b), or None if the icon is monochrome. Robust to anti-
+    aliasing: takes the saturated/bright pixels, keeps the most-saturated `core_frac` of them and
+    returns their per-channel MEDIAN (a single most-saturated pixel is an AA blend and unstable)."""
+    sat = [(p, _hsv(p)[1]) for p in list(crop.convert("RGB").getdata()) if _hsv(p)[2] > min_val and _hsv(p)[1] > min_sat]
+    if not sat:
+        return None
+    sat.sort(key=lambda t: -t[1])
+    core = [p for p, _ in sat[: max(1, int(len(sat) * core_frac))]]
+    return _median_rgb(core)
+
+
+def body_grey(crop, max_sat=0.18, min_val=0.45, max_val=0.90):
+    """The monochrome body stroke colour = MEDIAN of the low-saturation (grey) pixels, EXCLUDING
+    near-white (`v > max_val`) so bright LABEL TEXT bleeding into the crop (#f5f5f5) can't masquerade
+    as the icon body (#c7c7c7) — that false-fails monochrome icons. Median (not brightest) so AA edges
+    and a little stray text don't shift it; the icon stroke dominates a well-located crop."""
+    greys = [p for p in list(crop.convert("RGB").getdata())
+             if _hsv(p)[1] < max_sat and min_val < _hsv(p)[2] <= max_val]
+    return _median_rgb(greys) if greys else None
+
+
+def ink_color(crop, min_val=0.30):
+    """MEDIAN colour of the glyph 'ink' = every pixel brighter than the dark bar background. The
+    gross body-as-accent bug flips this from grey to the accent colour (Δ~140); a correct icon stays
+    body-dominant. Reliable where body/accent extraction (which can return None on AA) is not."""
+    px = [p for p in list(crop.convert("RGB").getdata()) if _hsv(p)[2] > min_val]
+    return _median_rgb(px) if px else None
+
+
+def _chan_delta(a, b):
+    return 999 if (a is None or b is None) else max(abs(a[i] - b[i]) for i in range(3))
+
+
+def gate_icon(native_crop, replica_crop, size=64, shape_min=0.60, color_max=24):
+    """Colour-aware accuracy gate for ONE rendered icon. Returns a dict with an alignment-tolerant
+    silhouette `shape` score + body/accent colour channel-deltas + `passed`. `passed` ⇔
+    shape ≥ shape_min AND body within color_max AND (if the native has an accent) accent within
+    color_max. This catches the exact bugs the mask scorer can't: mis-coloured body, wrong accent."""
+    nc, rc = native_crop.convert("RGB"), replica_crop.convert("RGB")
+    shp = score(normalize(_native_ink(nc), size), normalize(_native_ink(rc), size))
+    nb, rb = body_grey(nc), body_grey(rc)
+    na, ra = dominant_accent(nc), dominant_accent(rc)
+    ni, ri = ink_color(nc), ink_color(rc)
+    body_d, acc_d = _chan_delta(nb, rb), _chan_delta(na, ra)
+    color_ok = body_d <= color_max and (na is None or acc_d <= color_max)
+    return {
+        "shape": round(shp, 3),
+        "body_delta": body_d,
+        "accent_delta": (None if na is None else acc_d),
+        "ink_delta": _chan_delta(ni, ri),
+        "native_accent": na, "replica_accent": ra,
+        "native_body": nb, "replica_body": rb,
+        "native_ink": ni, "replica_ink": ri,
+        "passed": bool(shp >= shape_min and color_ok),
+    }
+
+
+def locate_glyph(native_img, template_crop, center, search=(60, 28), step=2):
+    """Find the native glyph by sliding the CLEAN replica glyph (`template_crop`) over `native_img`
+    around `center=(cx,cy)` within ±`search` px. Self-aligning — NEVER trust a fixed box, which
+    catches label text ("Pic"/"Extr"/"Sc"). Returns (iou, native_crop) where native_crop is the RGB
+    crop at the best-matching position (for colour sampling); iou is the silhouette overlap there."""
+    T = _binarize(_native_ink(template_crop.convert("RGB")))
+    bb = T.getbbox()
+    if bb:
+        T = T.crop(bb)
+    w, h = T.size
+    cx, cy = center
+    sx, sy = search
+    x0, y0 = cx - w // 2, cy - h // 2
+    best = None
+    for dy in range(-sy, sy + 1, step):
+        for dx in range(-sx, sx + 1, step):
+            x, y = x0 + dx, y0 + dy
+            patch = _binarize(_native_ink(native_img.crop((x, y, x + w, y + h)).convert("RGB")))
+            inter = ImageStat.Stat(ImageChops.darker(patch, T)).sum[0]
+            union = ImageStat.Stat(ImageChops.lighter(patch, T)).sum[0] or 1
+            iou = inter / union
+            if best is None or iou > best[0]:
+                best = (iou, x, y, w, h)
+    iou, x, y, w, h = best
+    return iou, native_img.crop((x, y, x + w, y + h))
+
+
+def gate_at(native_img, replica_img, box, search=(60, 28), color_max=14):
+    """Gate ONE icon end-to-end: `box=(x,y,w,h)` is the icon's position in the REPLICA render (the
+    generator knows it). Crops the replica glyph as the template, locates the native glyph by sliding
+    it (alignment-free), and runs `gate_icon`. Returns the gate_icon dict plus `loc` (template IoU)
+    and the located crops. Shape stays advisory here — see `icon_gate.py` for the PASS/EYEBALL/FAIL
+    policy (colour is the hard gate; a ~0.5%% stroke-weight difference must NOT fail)."""
+    x, y, w, h = box
+    rc = replica_img.crop((x, y, x + w, y + h))
+    iou, nc = locate_glyph(native_img, rc, (x + w // 2, y + h // 2), search=search)
+    g = gate_icon(nc, rc, color_max=color_max)
+    g["loc"] = round(iou, 3)
+    return g, nc, rc
 
 
 # ---------------------------------------------------------------- lock (icon_map.json)

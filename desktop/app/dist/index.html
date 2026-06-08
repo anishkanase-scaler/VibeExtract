@@ -1010,6 +1010,18 @@
     tip.style.top=Math.min(e.clientY+14, window.innerHeight-tip.offsetHeight-6)+'px';
   },true);
   document.addEventListener('mouseleave',clear,true);
+})();
+// A replica with many elements (a wide ribbon row, or a tall window) was clipped because the pane
+// is smaller than the component — even though it WAS fully extracted. NEVER shrink to fit: show it
+// at 1:1 and let the preview SCROLL on whichever axis overflows. We override the replica's own
+// overflow:hidden so the iframe gets horizontal/vertical scrollbars as needed; a no-op when it fits.
+(function(){
+  function scrollable(){
+    var de=document.documentElement, b=document.body;
+    if(b){ b.style.transform='none'; }            // never scale — undo any prior fit-scaling
+    if(de){ de.style.overflow='auto'; }           // scroll H and/or V at full size
+  }
+  window.addEventListener('load',scrollable); setTimeout(scrollable,30);
 })();<\/script>`;
 
     let axOverlayOn = false;

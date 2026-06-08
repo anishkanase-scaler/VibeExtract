@@ -393,6 +393,7 @@ mod tests {
             role_description: None,
             bounds: Some(ScreenRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }),
             bg: None,
+            child_source: None,
             children,
         }
     }
@@ -411,6 +412,7 @@ mod tests {
             click: None,
             ax_shallow: false,
             crop_path: None,
+            ax_tree: None,
         }
     }
 

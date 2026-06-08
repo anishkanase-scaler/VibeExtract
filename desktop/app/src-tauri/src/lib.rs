@@ -535,7 +535,9 @@ async fn start_pick_mode(app: AppHandle) -> Result<(), String> {
         let mut s = state.0.lock().unwrap();
         s.active = true;
         s.selected.clear();
-        s.locked_pid = None;
+        // Lock the whole session to the target app up front (Problem 2). If VibeExtract
+        // itself was frontmost, target_pid is None → the first pick lazy-locks it.
+        s.locked_pid = target_pid;
         s.woken_pids.clear();
         s.target_pid = target_pid;
         s.last_hover = None;
@@ -637,13 +639,15 @@ async fn start_pick_mode(app: AppHandle) -> Result<(), String> {
     // Spawn the hover-tracking task.
     spawn_hover_task(app.clone());
 
-    // Register Esc and ↑/↓ as temporary global shortcuts. Esc cancels pick
-    // mode; ↑/↓ walk the AX ancestry of the currently hovered element so the
-    // user can select a larger / smaller region than Apple's AX hit-test
-    // returns by default. Unregistered in stop_pick_mode so we don't steal
-    // these keys from other apps while VibeExtract isn't actively picking.
+    // Register Esc, Enter and ↑/↓ as temporary global shortcuts. Esc cancels pick
+    // mode; Enter LOCKS the selection (resume the frozen app + exit, see
+    // `commit_selection`); ↑/↓ walk the AX ancestry of the currently hovered element
+    // so the user can select a larger / smaller region than Apple's AX hit-test
+    // returns by default. Unregistered in stop_pick_mode so we don't steal these keys
+    // from other apps while VibeExtract isn't actively picking.
     let pick_keys = [
         (Shortcut::new(None, Code::Escape), "Esc"),
+        (Shortcut::new(None, Code::Enter), "Enter"),
         (Shortcut::new(None, Code::ArrowUp), "ArrowUp"),
         (Shortcut::new(None, Code::ArrowDown), "ArrowDown"),
     ];
@@ -666,15 +670,24 @@ async fn stop_pick_mode(app: AppHandle) -> Result<(), String> {
         s.active = false;
         s.selected.clear();
         s.locked_pid = None;
+        unfreeze_app(&mut s.freeze_pid); // resume any frozen app — Esc must never leave it suspended
     }
-    // Drop the event tap — restores normal click behaviour for the user.
+    teardown_pick_mode_ui(&app);
+    Ok(())
+}
+
+/// Tear down the pick-mode UI WITHOUT touching the selection/lock state: drop the
+/// event tap (restores normal clicks), hide the overlay, unregister the pick-mode
+/// shortcuts, and tell the UI pick mode ended. Shared by `stop_pick_mode` (cancel,
+/// which also clears the selection) and `commit_selection` (which KEEPS it).
+fn teardown_pick_mode_ui(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     {
         let tap_state = app.state::<EventTapState>();
         let mut guard = tap_state.0.lock().unwrap();
         if guard.is_some() {
             drop(guard.take()); // explicit Drop call
-            log::info!("event_tap: dropped on stop_pick_mode");
+            log::info!("event_tap: dropped on pick-mode teardown");
         }
     }
     if let Some(overlay) = app.get_webview_window("overlay") {
@@ -686,6 +699,7 @@ async fn stop_pick_mode(app: AppHandle) -> Result<(), String> {
     // so we don't kill the ⌘⇧S/E/X bindings via unregister_all.
     let pick_keys = [
         (Shortcut::new(None, Code::Escape), "Esc"),
+        (Shortcut::new(None, Code::Enter), "Enter"),
         (Shortcut::new(None, Code::ArrowUp), "ArrowUp"),
         (Shortcut::new(None, Code::ArrowDown), "ArrowDown"),
     ];
@@ -696,12 +710,89 @@ async fn stop_pick_mode(app: AppHandle) -> Result<(), String> {
         }
     }
     let _ = app.emit("pick-mode-changed", false);
+}
+
+/// Enter during pick mode: LOCK the current selection and RESUME the frozen target,
+/// then exit pick mode and bring VibeExtract forward with the captured result. The
+/// selection (with its pick-time crop + AX subtree) is KEPT and persisted, so
+/// extraction works even after the original app is closed/switched. If nothing has
+/// been picked yet, stays armed and nudges the user.
+#[tauri::command]
+async fn commit_selection(app: AppHandle) -> Result<(), String> {
+    log::info!("commit_selection");
+    let list = {
+        let state = app.state::<PickSessionState>();
+        let mut s = state.0.lock().unwrap();
+        if s.selected.is_empty() {
+            None
+        } else {
+            s.active = false;
+            unfreeze_app(&mut s.freeze_pid); // resume the target — the pick is fully captured
+            Some(s.selected.clone())
+        }
+    };
+    let Some(list) = list else {
+        let _ = app.emit("toast", "Click an element first, then press Enter to lock it.");
+        return Ok(());
+    };
+    persist_and_broadcast(&app, &list); // ensure last-selection.json reflects the final pick
+    teardown_pick_mode_ui(&app);
+    let _ = app.emit("selection-committed", list.len());
+    raise_main_window(&app);
     Ok(())
 }
 
 /// Monotonic counter for pick-time crop filenames (`pick-crop-<pid>-<seq>.png`).
 /// The unique seq also serves as a per-pick identity for the auto-trigger watcher.
 static PICK_CROP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-global mirror of the session's frozen pid (`0` = none). Written ONLY via
+/// `record_freeze`/`clear_freeze_record` (called by `freeze_app`/`unfreeze_app`). It is
+/// lock-free so the panic hook and the `RunEvent::Exit` handler can SIGCONT a frozen
+/// target WITHOUT touching the (possibly poisoned/held) `PickSession` mutex.
+static FROZEN_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Path to a tiny file holding the currently-frozen pid, so that if VibeExtract is
+/// `SIGKILL`ed (no in-process handler can run) the NEXT launch can SIGCONT the orphan.
+/// Set once at setup; helpers no-op until then.
+static FROZEN_PID_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Banner shown on the overlay while the target is SIGSTOP-frozen for ↑/↓ refinement,
+/// so the pause reads as intentional (Problem 1) rather than a crash.
+const REFINE_BANNER: &str =
+    "Target paused for refine — ↑/↓ resize · Enter to lock · Esc to cancel";
+
+/// Record a freeze in the lock-free atomic + the on-disk recovery file. Best-effort.
+fn record_freeze(pid: i32) {
+    FROZEN_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+    if let Some(p) = FROZEN_PID_FILE.get() {
+        let _ = std::fs::write(p, pid.to_string());
+    }
+}
+
+/// Clear the freeze record (atomic + file). Best-effort.
+fn clear_freeze_record() {
+    FROZEN_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+    if let Some(p) = FROZEN_PID_FILE.get() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// At startup, SIGCONT any pid left frozen by a previous VibeExtract that was killed
+/// before it could resume the target (the `SIGKILL` case). Best-effort; clears the file.
+fn resume_orphaned_freeze_on_launch() {
+    let Some(path) = FROZEN_PID_FILE.get() else { return };
+    if let Ok(s) = std::fs::read_to_string(path) {
+        if let Ok(pid) = s.trim().parse::<i32>() {
+            if pid > 0 {
+                log::warn!("resume_orphaned_freeze_on_launch: SIGCONT orphaned pid {}", pid);
+                #[cfg(target_os = "macos")]
+                vibe_extract_core::app_freeze_macos::resume(pid);
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 /// Capture the picked element's pixels NOW (occlusion-immune via `screencapture -l`
 /// on the owning window, cropped to the element bounds) → sets `picked.crop_path`.
@@ -753,6 +844,57 @@ async fn capture_pick_crop(app: &AppHandle, picked: &mut PickedElement) {
     }
 }
 
+/// Depth cap for the pick-time AX subtree walk — matches the live `ax_subtree_at_point`
+/// default and the dispatcher's window walk.
+const PICK_AX_MAX_DEPTH: u32 = 12;
+/// Node cap so a pathological tree can't bloat `last-selection.json` / RAM. On overflow
+/// we drop the tree (leave `None`) rather than ship a truncated, misleading structure.
+#[cfg(target_os = "macos")]
+const PICK_AX_MAX_NODES: usize = 4000;
+
+/// Capture the FULL AX subtree rooted at the SAME element the user picked, NOW — while
+/// the target app is running (call BEFORE any freeze; a SIGSTOP'd app can't answer AX).
+/// Sets `picked.ax_tree` so `/replicate-ui` has the element's structure even after the
+/// app is closed/backgrounded. Best-effort; shallow (Electron) picks are skipped — their
+/// subtree is a meaningless placeholder, so the CDP / `extract_component` path re-resolves
+/// them. Used by the mouse path (`overlay_click`); the keyboard ↑/↓ path captures inline.
+#[cfg(target_os = "macos")]
+async fn capture_pick_ax_tree(picked: &mut PickedElement) {
+    if picked.ax_shallow {
+        return;
+    }
+    let pid = picked.pid;
+    let snapshot = picked.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        // Re-resolve the SAME element (climb to matching bounds), then walk its subtree.
+        let el = reacquire_current(Some(pid), &snapshot)?;
+        let node = vibe_extract_core::ax_macos::walk_node(&el, PICK_AX_MAX_DEPTH);
+        if vibe_extract_core::ax_macos::count_nodes(&node) > PICK_AX_MAX_NODES {
+            return None;
+        }
+        Some(node)
+    })
+    .await;
+    match res {
+        Ok(Some(node)) => {
+            log::info!(
+                "capture_pick_ax_tree: {} nodes for pid {}",
+                vibe_extract_core::ax_macos::count_nodes(&node),
+                pid
+            );
+            picked.ax_tree = Some(node);
+        }
+        Ok(None) => log::info!(
+            "capture_pick_ax_tree: no tree for pid {} (reacquire failed or over cap)",
+            pid
+        ),
+        Err(e) => log::warn!("capture_pick_ax_tree: task join error: {}", e),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn capture_pick_ax_tree(_picked: &mut PickedElement) {}
+
 /// Persist the current selection to `last-selection.json` (read by the MCP
 /// `get_selection` tool) and push the outlines + count to the overlay/main UI.
 fn persist_and_broadcast(app: &AppHandle, list: &[PickedElement]) {
@@ -776,21 +918,40 @@ fn persist_and_broadcast(app: &AppHandle, list: &[PickedElement]) {
 }
 
 /// Freeze the picked app (SIGSTOP) so its hover panel can't close while the cursor
-/// roams freely; record its pid in the session. No-op off macOS.
+/// roams freely; record its pid in the session AND the lock-free recovery record.
+/// The SOLE writer of a freeze (with `unfreeze_app`). Resumes any previously-frozen
+/// DIFFERENT app first (no overwrite-leak) and refuses to record a dead pid. No-op off macOS.
 fn freeze_app(freeze_pid: &mut Option<i32>, pid: i32) {
     #[cfg(target_os = "macos")]
-    vibe_extract_core::app_freeze_macos::suspend(pid);
+    {
+        // Resume any previously-frozen different app before overwriting — never orphan it.
+        if let Some(old) = *freeze_pid {
+            if old != pid {
+                vibe_extract_core::app_freeze_macos::resume(old);
+            }
+        }
+        // Don't record a dead/recycled pid as frozen (suspend already no-ops on it).
+        if !vibe_extract_core::app_freeze_macos::is_alive(pid) {
+            *freeze_pid = None;
+            clear_freeze_record();
+            return;
+        }
+        vibe_extract_core::app_freeze_macos::suspend(pid);
+    }
     *freeze_pid = Some(pid);
+    record_freeze(pid);
 }
 
-/// Resume a frozen app (SIGCONT) and clear the flag. Returns the pid that was frozen
-/// so the caller can re-freeze it after a brief live operation (e.g. an AX query).
+/// Resume a frozen app (SIGCONT) and clear both the session flag and the recovery
+/// record. Returns the pid that was frozen so the caller can re-freeze it after a
+/// brief live operation (e.g. an AX query). The SOLE clearer of a freeze.
 fn unfreeze_app(freeze_pid: &mut Option<i32>) -> Option<i32> {
     let p = freeze_pid.take();
     #[cfg(target_os = "macos")]
     if let Some(pid) = p {
         vibe_extract_core::app_freeze_macos::resume(pid);
     }
+    clear_freeze_record();
     p
 }
 
@@ -1003,44 +1164,67 @@ async fn overlay_click(
     // skip inside the helper (their bounds are a click placeholder → re-resolved
     // via CDP later).
     capture_pick_crop(&app, &mut picked).await;
+    // Capture the element's AX subtree NOW — app still running, before any freeze — so
+    // /replicate-ui has the structure even after the app closes (Problem 4). Shallow
+    // (Electron) picks skip inside the helper (re-resolved via the CDP path later).
+    #[cfg(target_os = "macos")]
+    capture_pick_ax_tree(&mut picked).await;
 
-    // Same-app constraint when shift-clicking.
+    // Single-app lock (Problem 2): once a session is locked to an app, EVERY click
+    // (shift or not) must land in that app; a click elsewhere is rejected until Esc.
     let state = app.state::<PickSessionState>();
     // Crop files of a selection we're about to discard (fresh non-shift pick),
     // so the output dir doesn't accumulate orphaned pick-crop PNGs over a session.
     let mut dropped_crops: Vec<String> = Vec::new();
-    let new_selected_list = {
+    // Resolve the click against the lock in ONE critical section, then act on the
+    // outcome (toast/return or proceed) after releasing the mutex.
+    enum ClickOutcome {
+        Inactive,
+        CrossApp(i32),
+        Committed(Vec<PickedElement>),
+    }
+    let outcome = {
         let mut s = state.0.lock().unwrap();
         if !s.active {
-            return Err("pick mode not active".into());
-        }
-        if shift {
-            if let Some(locked) = s.locked_pid {
-                if picked.pid != locked {
-                    return Err(format!(
-                        "Cross-app selection not allowed (locked to pid {}). Press Escape to start over.",
-                        locked
-                    ));
-                }
-            }
-            s.selected.push(picked.clone());
+            ClickOutcome::Inactive
+        } else if let Some(locked) = s.locked_pid.filter(|&l| l != picked.pid) {
+            ClickOutcome::CrossApp(locked)
+        } else {
+            // Lazy-lock on the first pick (armed with VibeExtract frontmost → target_pid
+            // was None); also scope the hover hit-test to this app from now on.
             if s.locked_pid.is_none() {
                 s.locked_pid = Some(picked.pid);
+                s.target_pid = Some(picked.pid);
             }
-        } else {
-            dropped_crops.extend(s.selected.iter().filter_map(|e| e.crop_path.clone()));
-            s.selected.clear();
-            s.selected.push(picked.clone());
-            s.locked_pid = Some(picked.pid);
-            // A fresh click is a new nav anchor — drop any keyboard-walk path.
-            s.nav_stack.clear();
-            s.nav_active = false;
-            s.nav_anchor_cursor = None;
+            if shift {
+                s.selected.push(picked.clone());
+            } else {
+                dropped_crops.extend(s.selected.iter().filter_map(|e| e.crop_path.clone()));
+                s.selected.clear();
+                s.selected.push(picked.clone());
+                // A fresh click is a new nav anchor — drop any keyboard-walk path.
+                s.nav_stack.clear();
+                s.nav_active = false;
+                s.nav_anchor_cursor = None;
+            }
+            // Freeze the picked app so its hover panel stays open while the cursor roams
+            // during ↑/↓ refine (SIGSTOP). Released on Enter (commit) / Esc / stop, and
+            // by the safety net. Same pid as the lock → re-freezing the same app is fine.
+            freeze_app(&mut s.freeze_pid, picked.pid);
+            ClickOutcome::Committed(s.selected.clone())
         }
-        // Freeze the picked app so its hover panel stays open while the cursor roams
-        // free (SIGSTOP). Released on Esc/clear/stop, or briefly for the next pick/nav.
-        freeze_app(&mut s.freeze_pid, picked.pid);
-        s.selected.clone()
+    };
+    let new_selected_list = match outcome {
+        ClickOutcome::Inactive => return Err("pick mode not active".into()),
+        ClickOutcome::CrossApp(locked) => {
+            #[cfg(target_os = "macos")]
+            let name = app_name_for_pid(locked).unwrap_or_else(|| format!("pid {}", locked));
+            #[cfg(not(target_os = "macos"))]
+            let name = format!("pid {}", locked);
+            let _ = app.emit("toast", format!("Locked to {} — press Esc to switch apps.", name));
+            return Err(format!("cross-app selection blocked (locked to pid {})", locked));
+        }
+        ClickOutcome::Committed(list) => list,
     };
     // Best-effort GC of the superseded selection's crops (outside the lock).
     for p in dropped_crops {
@@ -1049,6 +1233,11 @@ async fn overlay_click(
 
     // Persist for the MCP `get_selection` tool + push outlines/count to the UI.
     persist_and_broadcast(&app, &new_selected_list);
+    // The target is now SIGSTOP-frozen for ↑/↓ refinement — surface a banner so the
+    // pause reads as intentional (not a crash) and tell the user how to lock/cancel.
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.emit("overlay-status", REFINE_BANNER);
+    }
     log::info!(
         "overlay_click: selection list now has {} element(s)",
         new_selected_list.len()
@@ -1330,6 +1519,7 @@ async fn handle_electron_relaunch_flow(
     // they don't fire while the dialog is up.
     for s in [
         Shortcut::new(None, Code::Escape),
+        Shortcut::new(None, Code::Enter),
         Shortcut::new(None, Code::ArrowUp),
         Shortcut::new(None, Code::ArrowDown),
     ] {
@@ -1625,6 +1815,10 @@ async fn walk_hover_ancestry(app: AppHandle, go_up: bool) -> Result<(), String> 
     // AxElement handles never cross an await). Ported from the web Alt+Arrow flow:
     //   ↑ = next genuinely-larger ancestor (skips wrapper nodes; capped at window),
     //   ↓ = retrace the ↑ path if possible, else the first child.
+    // Grow-to-row: ↑ first selects the whole sibling BAND (e.g. the toolbar row) when one
+    // exists, only then the real parent. The band's bounds aren't a single AX node, so we
+    // build its subtree synthetically from the members (set inside the closure).
+    let mut band_tree: Option<vibe_extract_core::ax_macos::Node> = None;
     let computed: Result<PickedElement, String> = (|| {
         if !go_up {
             if let Some(prev) = nav_stack
@@ -1643,11 +1837,48 @@ async fn walk_hover_ancestry(app: AppHandle, go_up: bool) -> Result<(), String> 
         } else {
             let el = reacquire_current(target_pid_opt, &current)
                 .ok_or("couldn't locate the current element in the AX tree")?;
+            // Sibling BAND (the row) before the real parent — selects "the whole header
+            // toolbar row" in flat trees (WPS: tabs are direct AXWindow children).
+            if let Some((band, kids)) =
+                vibe_extract_core::ax_macos::sibling_band(&el, &current.bounds, PICK_AX_MAX_DEPTH)
+            {
+                band_tree = Some(vibe_extract_core::ax_macos::Node {
+                    role: "AXGroup".into(),
+                    subrole: None,
+                    name: String::new(),
+                    identifier: None,
+                    value: None,
+                    role_description: Some("group".into()),
+                    bounds: Some(band),
+                    bg: None,
+                    child_source: Some("AXSiblingBand".into()),
+                    children: kids,
+                });
+                nav_stack.push(current.clone());
+                return Ok(region_picked(band, &el));
+            }
             let parent = ax_parent_of(&el, &current.bounds, our_pid)?;
             nav_stack.push(current.clone());
             Ok(parent)
         }
     })();
+    // Capture the new element's AX subtree NOW, while the app is still UNFROZEN (we
+    // re-freeze just below) — a SIGSTOP'd app can't answer AX. Synchronous AX FFI like
+    // the walk above; best-effort, so a miss just leaves ax_tree = None (Problem 4).
+    // Skipped for a band region (its tree is the synthetic `band_tree`) and for a
+    // ↓-retrace (where `computed` already carries the stored element's tree).
+    let new_ax_tree = if band_tree.is_some() {
+        None
+    } else {
+        computed.as_ref().ok().and_then(|np| {
+            if np.ax_tree.is_some() {
+                return None; // ↓-retrace: keep the stored element's tree
+            }
+            let el = reacquire_current(target_pid_opt, np)?;
+            let node = vibe_extract_core::ax_macos::walk_node(&el, PICK_AX_MAX_DEPTH);
+            (vibe_extract_core::ax_macos::count_nodes(&node) <= PICK_AX_MAX_NODES).then_some(node)
+        })
+    };
     // Live AX query is done — re-freeze the app immediately (kept brief so the panel
     // doesn't close), regardless of whether navigation succeeded.
     if let Some(pid) = frozen_pid {
@@ -1658,6 +1889,11 @@ async fn walk_hover_ancestry(app: AppHandle, go_up: bool) -> Result<(), String> 
 
     let mut picked = new_picked;
     picked.click = anchor_click;
+    if let Some(bt) = band_tree {
+        picked.ax_tree = Some(bt); // synthetic toolbar-row group
+    } else if picked.ax_tree.is_none() {
+        picked.ax_tree = new_ax_tree; // fresh ↑/↓ target (↓-retrace keeps its own)
+    }
     let cursor = vibe_extract_core::ax_macos::current_cursor();
 
     // INSTANT commit — move the selection + highlight NOW so ↑/↓ feel immediate.
@@ -1789,6 +2025,34 @@ fn picked_from(
         click: None,
         ax_shallow: false,
         crop_path: None,
+        ax_tree: None,
+    }
+}
+
+/// Build a synthetic "region" PickedElement (e.g. a whole toolbar ROW) covering `bounds`.
+/// This isn't a single AX node, so role is `AXGroup` and `ax_shallow` is false (the bounds
+/// are real). Used by ↑ grow-to-row; its `ax_tree` is filled in by the caller from the
+/// band members. `el` supplies the owning pid + enclosing window.
+#[cfg(target_os = "macos")]
+fn region_picked(
+    bounds: vibe_extract_core::capture::ScreenRect,
+    el: &vibe_extract_core::ax_macos::AxElement,
+) -> PickedElement {
+    let pid = el.pid().unwrap_or(-1);
+    PickedElement {
+        role: "AXGroup".into(),
+        subrole: None,
+        name: String::new(),
+        identifier: None,
+        bounds,
+        pid,
+        app_path: vibe_extract_core::ax_macos::pid_to_path(pid),
+        window_title: None,
+        window_bounds: el.enclosing_window().and_then(|w| w.rect()),
+        click: None,
+        ax_shallow: false,
+        crop_path: None,
+        ax_tree: None,
     }
 }
 
@@ -1912,9 +2176,8 @@ fn spawn_hover_task(app: AppHandle) {
     let our_pid: i32 = std::process::id() as i32;
     tauri::async_runtime::spawn(async move {
         // Throttle state for the Electron CDP-hover probe (persists across ticks):
-        // last (cursor x, y, widen_level) we probed, and the last outlined box.
+        // the last (cursor x, y, widen_level) we probed.
         let mut last_probe: Option<(f64, f64, u32)> = None;
-        let mut last_box: Option<vibe_extract_core::capture::ScreenRect> = None;
         loop {
             // Tick at ~30Hz.
             tokio::time::sleep(std::time::Duration::from_millis(33)).await;
@@ -2015,8 +2278,8 @@ fn spawn_hover_task(app: AppHandle) {
                                         click: Some(pt),
                                         ax_shallow: false,
                                         crop_path: None,
+                                        ax_tree: None,
                                     });
-                                    last_box = Some(bounds);
                                     if let Some(overlay) = app.get_webview_window("overlay") {
                                         let _ = overlay.emit(
                                             "overlay-hover",
@@ -2035,18 +2298,15 @@ fn spawn_hover_task(app: AppHandle) {
                                     }
                                 }
                                 _ => {
-                                    // No DOM element under the point (or probe
-                                    // failed) — keep the last box, move the cursor.
+                                    // No DOM element under the point (or probe failed) —
+                                    // CLEAR the outline (don't leave a stale box painted
+                                    // once the cursor leaves the content) + move cursor.
+                                    state.lock().unwrap().last_hover = None;
                                     if let Some(overlay) = app.get_webview_window("overlay") {
                                         let _ = overlay.emit(
                                             "overlay-hover",
                                             OverlayHoverPayload {
-                                                bounds: last_box.map(|b| OverlayBounds {
-                                                    x: b.x,
-                                                    y: b.y,
-                                                    w: b.w,
-                                                    h: b.h,
-                                                }),
+                                                bounds: None,
                                                 role: String::new(),
                                                 name: String::new(),
                                                 cursor: OverlayCursor { x: pt.x, y: pt.y },
@@ -2054,6 +2314,21 @@ fn spawn_hover_task(app: AppHandle) {
                                         );
                                     }
                                 }
+                            }
+                        } else {
+                            // Cursor is OUTSIDE the target window — clear any stale
+                            // outline so it doesn't bleed over another app or desktop.
+                            state.lock().unwrap().last_hover = None;
+                            if let Some(overlay) = app.get_webview_window("overlay") {
+                                let _ = overlay.emit(
+                                    "overlay-hover",
+                                    OverlayHoverPayload {
+                                        bounds: None,
+                                        role: String::new(),
+                                        name: String::new(),
+                                        cursor: OverlayCursor { x: pt.x, y: pt.y },
+                                    },
+                                );
                             }
                         }
                     }
@@ -2161,6 +2436,7 @@ fn spawn_hover_task(app: AppHandle) {
                                         click: Some(pt),
                                         ax_shallow,
                                         crop_path: None,
+                                        ax_tree: None,
                                     });
                                 }
                                 (needs, ())
@@ -2273,6 +2549,22 @@ pub fn run() {
         .filter_level(log::LevelFilter::Info)
         .format_timestamp(None)
         .init();
+
+    // Safety net: if VibeExtract panics on ANY thread while a target app is SIGSTOP-
+    // frozen, resume it so we never leave a user's app stuck. Reads ONLY the lock-free
+    // FROZEN_PID (no Tauri state / no mutex — a poisoned PickSession lock here would
+    // otherwise deadlock or re-panic). Chains the previous hook.
+    {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let pid = FROZEN_PID.swap(0, std::sync::atomic::Ordering::SeqCst);
+            if pid > 0 {
+                #[cfg(target_os = "macos")]
+                vibe_extract_core::app_freeze_macos::resume(pid);
+            }
+            prev(info);
+        }));
+    }
 
     let output_dir = find_output_dir();
     log::info!(
@@ -2456,6 +2748,10 @@ pub fn run() {
                             // result instead of staring at their target app.
                             let _ = stop_pick_mode(app.clone()).await;
                             raise_main_window(&app);
+                        } else if combo.contains("Enter") {
+                            // Enter LOCKS the current selection: resume the frozen
+                            // target, exit pick mode, and surface the captured result.
+                            let _ = commit_selection(app.clone()).await;
                         } else if combo.contains("ArrowUp")
                             || combo.contains("ArrowDown")
                         {
@@ -2489,6 +2785,7 @@ pub fn run() {
             request_ax_permission,
             start_pick_mode,
             stop_pick_mode,
+            commit_selection,
             overlay_click,
             export_selection,
             extract_frontmost_window_cmd,
@@ -2502,6 +2799,53 @@ pub fn run() {
             mcp::mcp_toggle,
         ])
         .setup(|app| {
+            // Freeze-recovery: point the on-disk record at the output dir, then resume
+            // any app a previous (SIGKILLed) VibeExtract left frozen. Do this FIRST,
+            // before anything can arm a new freeze.
+            {
+                let dir = app.state::<OutputDir>().inner().0.clone();
+                let _ = FROZEN_PID_FILE.set(dir.join("frozen-pid"));
+                resume_orphaned_freeze_on_launch();
+            }
+
+            // Watchdog: force-resume an ORPHANED freeze — `freeze_pid` set while NO pick
+            // session is active (`!active`), which should never persist. It deliberately
+            // does NOT fire during refinement (active==true), so a user pausing mid-refine
+            // is never interrupted. ~1s cadence, ~2s grace.
+            {
+                let h = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut orphan_since: Option<std::time::Instant> = None;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                        let Some(state) = h.try_state::<PickSessionState>() else { continue };
+                        let stuck = {
+                            let s = state.0.lock().unwrap();
+                            s.freeze_pid.is_some() && !s.active
+                        };
+                        if !stuck {
+                            orphan_since = None;
+                            continue;
+                        }
+                        match orphan_since {
+                            None => orphan_since = Some(std::time::Instant::now()),
+                            Some(t) if t.elapsed() >= std::time::Duration::from_secs(2) => {
+                                let mut s = state.0.lock().unwrap();
+                                if s.freeze_pid.is_some() && !s.active {
+                                    log::warn!(
+                                        "freeze watchdog: force-resuming orphaned pid {:?}",
+                                        s.freeze_pid
+                                    );
+                                    unfreeze_app(&mut s.freeze_pid);
+                                }
+                                orphan_since = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
             // Three hotkeys: Cmd+Shift+S / E / X.
             #[cfg(target_os = "macos")]
             let mods = Modifiers::SUPER | Modifiers::SHIFT;
@@ -2557,11 +2901,15 @@ pub fn run() {
             let app_clone = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let our_pid = std::process::id() as i32;
+                // Tracks whether we've cleared the overlay because the target app isn't
+                // frontmost, so we only emit on transitions (not every tick).
+                let mut overlay_suppressed = false;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     #[cfg(target_os = "macos")]
                     {
-                        if let Some(pid) = frontmost_app_pid_via_nsworkspace() {
+                        let front = frontmost_app_pid_via_nsworkspace();
+                        if let Some(pid) = front {
                             if pid != our_pid && pid > 0 {
                                 if let Some(state) =
                                     app_clone.try_state::<LastForeignAppState>()
@@ -2572,6 +2920,40 @@ pub fn run() {
                                     }
                                     *g = Some(pid);
                                 }
+                            }
+                        }
+                        // Overlay-bleed guard (Problem 3): while picking, only PAINT the
+                        // outlines when the locked/target app is frontmost. When the user
+                        // switches to another app or Space, clear them so they don't bleed
+                        // over it; restore (re-emit the committed outlines) when it returns.
+                        if let Some(ps) = app_clone.try_state::<PickSessionState>() {
+                            let (active, want, frozen) = {
+                                let s = ps.0.lock().unwrap();
+                                (s.active, s.locked_pid.or(s.target_pid), s.freeze_pid.is_some())
+                            };
+                            if active {
+                                let on_target =
+                                    matches!((front, want), (Some(f), Some(w)) if f == w);
+                                if !on_target && !overlay_suppressed {
+                                    overlay_suppressed = true;
+                                    if let Some(overlay) = app_clone.get_webview_window("overlay") {
+                                        let _ = overlay.emit("overlay-suppress", ());
+                                    }
+                                } else if on_target && overlay_suppressed {
+                                    overlay_suppressed = false;
+                                    let selection = { ps.0.lock().unwrap().selected.clone() };
+                                    persist_and_broadcast(&app_clone, &selection);
+                                    // Re-show the refine banner if the target is still frozen.
+                                    if frozen {
+                                        if let Some(overlay) =
+                                            app_clone.get_webview_window("overlay")
+                                        {
+                                            let _ = overlay.emit("overlay-status", REFINE_BANNER);
+                                        }
+                                    }
+                                }
+                            } else if overlay_suppressed {
+                                overlay_suppressed = false; // reset when pick mode ends
                             }
                         }
                     }
@@ -2599,6 +2981,21 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Resume any frozen target on app exit so quitting VibeExtract never leaves
+            // a user's app suspended. (A SIGKILL of US can't run this — that case is
+            // covered by the on-disk record + resume_orphaned_freeze_on_launch.)
+            if matches!(
+                event,
+                tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+            ) {
+                let pid = FROZEN_PID.swap(0, std::sync::atomic::Ordering::SeqCst);
+                if pid > 0 {
+                    #[cfg(target_os = "macos")]
+                    vibe_extract_core::app_freeze_macos::resume(pid);
+                }
+            }
+        });
 }

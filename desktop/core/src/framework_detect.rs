@@ -58,6 +58,17 @@ fn detect_macos(executable: &Path) -> Framework {
         if frameworks_dir.join("Electron Framework.framework").exists() {
             return Framework::Electron;
         }
+        // A *top-level* CEF framework means a Chromium-embedded app whose web
+        // content is CDP-reachable — treat it like Electron. Deliberately NOT
+        // recursive: hybrids like WPS ship a CEF *addon* deep under
+        // Frameworks/office6/addons/cef while their actual shell is Qt, so a
+        // recursive search would misclassify the Qt app as Chromium.
+        if frameworks_dir
+            .join("Chromium Embedded Framework.framework")
+            .exists()
+        {
+            return Framework::Electron;
+        }
         // Some Electron apps rename the framework.
         if let Ok(entries) = std::fs::read_dir(&frameworks_dir) {
             for entry in entries.flatten() {
@@ -77,7 +88,31 @@ fn detect_macos(executable: &Path) -> Framework {
         return Framework::Electron;
     }
 
-    // Look for `.nib` / `.storyboardc` — strong signal for AppKit.
+    // Inspect the executable's OWN Mach-O load commands — the most reliable
+    // signal, because it reflects what *this* process links rather than what
+    // the bundle happens to ship. Runs BEFORE the `.nib` heuristic so a hybrid
+    // app that links Qt *and* carries nibs (e.g. a Qt shell with an AppKit
+    // share extension, like WPS) is classed Qt, not AppKit.
+    if let Ok(bytes) = std::fs::read(executable) {
+        if let Ok(goblin::Object::Mach(m)) = goblin::Object::parse(&bytes) {
+            let libs = collect_macho_dylibs(&m);
+            if let Some(fw) = classify_dylibs(&libs) {
+                return fw;
+            }
+            // Fat / multi-arch binaries yield no libs above (goblin's fat-slice
+            // API is version-unstable). dylib load paths are stored as plain
+            // ASCII, so fall back to a bounded raw-bytes scan for the same
+            // framework signatures.
+            if libs.is_empty() {
+                if let Some(fw) = classify_macho_bytes(&bytes) {
+                    return fw;
+                }
+            }
+        }
+    }
+
+    // Fallback: `.nib` / `.storyboardc` in Resources -> AppKit. Only reached
+    // when the Mach-O probe above was inconclusive.
     if resources_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&resources_dir) {
             for entry in entries.flatten() {
@@ -89,26 +124,65 @@ fn detect_macos(executable: &Path) -> Framework {
         }
     }
 
-    // Fallback: peek at the Mach-O binary's load commands via goblin.
-    // Looks for `LC_LOAD_DYLIB` referencing well-known frameworks.
-    if let Ok(bytes) = std::fs::read(executable) {
-        if let Ok(mach) = goblin::Object::parse(&bytes) {
-            if let goblin::Object::Mach(m) = mach {
-                let libs = collect_macho_dylibs(&m);
-                if libs.iter().any(|l| l.contains("Electron Framework")) {
-                    return Framework::Electron;
-                }
-                if libs.iter().any(|l| l.starts_with("@rpath/QtCore") || l.contains("QtCore.framework")) {
-                    return Framework::Qt;
-                }
-                if libs.iter().any(|l| l.contains("AppKit.framework")) {
-                    return Framework::AppKitNative;
-                }
-            }
-        }
-    }
-
     Framework::Unknown
+}
+
+/// Classify a list of linked dylib paths into a [`Framework`]. CEF/Chromium is
+/// checked before Qt so a binary that links both (a Chromium view embedded in a
+/// Qt shell) is treated as web/CDP-capable rather than plain Qt.
+#[cfg(target_os = "macos")]
+fn classify_dylibs(libs: &[String]) -> Option<Framework> {
+    if libs.iter().any(|l| l.contains("Electron Framework")) {
+        return Some(Framework::Electron);
+    }
+    if libs
+        .iter()
+        .any(|l| l.contains("Chromium Embedded Framework") || l.contains("libcef"))
+    {
+        return Some(Framework::Electron);
+    }
+    if libs
+        .iter()
+        .any(|l| l.starts_with("@rpath/QtCore") || l.contains("QtCore"))
+    {
+        return Some(Framework::Qt);
+    }
+    if libs.iter().any(|l| l.contains("AppKit.framework")) {
+        return Some(Framework::AppKitNative);
+    }
+    None
+}
+
+/// Raw-bytes fallback for fat/multi-arch Mach-O, where [`collect_macho_dylibs`]
+/// returns nothing. Searches the (bounded) head of the file for the same dylib
+/// path signatures `classify_dylibs` looks for — load commands live near each
+/// slice's start, and both arch slices link the same frameworks, so the first
+/// slice is sufficient.
+#[cfg(target_os = "macos")]
+fn classify_macho_bytes(bytes: &[u8]) -> Option<Framework> {
+    let scan = &bytes[..bytes.len().min(16 * 1024 * 1024)];
+    let has = |needle: &str| find_subslice(scan, needle.as_bytes());
+    if has("Electron Framework") {
+        return Some(Framework::Electron);
+    }
+    if has("Chromium Embedded Framework") || has("libcef") {
+        return Some(Framework::Electron);
+    }
+    if has("QtCore") {
+        return Some(Framework::Qt);
+    }
+    if has("AppKit.framework") {
+        return Some(Framework::AppKitNative);
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 #[cfg(target_os = "macos")]

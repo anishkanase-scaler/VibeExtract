@@ -394,3 +394,43 @@ Worked pipeline (proven on Excel **Insert** and Word **Layout** ribbons):
 
 Reference scratch: `.replicate-ui/excel-insert/build_insert.py`, `.replicate-ui/word-ribbon/build_word.py`
 (throwaway generators that import the toolkit — the method, not per-app code).
+
+## Qt / kdesign (`_kd`) icons: recolour BODY vs ACCENT, then a COLOUR-AWARE gate (the WPS lesson)
+
+Qt/Kingsoft `_kd` and `colorXStroke` SVGs split paint across classes: a theme-following **body**
+(`kd-color-icon-primary` / `.colorBlackStroke` / `var(--kd-color-icon-primary,#333333)`) and a **named
+accent** (`kd-color-icon-blue-primary`, `.colorBlueStroke`). The trap that shipped wrong icons: a
+recolour that picks **one colour per icon** and applies it to *every* class — so an accented icon's
+document **body** gets painted the accent colour (a fully-blue PDF→Word doc instead of grey-doc + blue
+"W"). It's invisible on monochrome icons and only bites accented ones, so it survives until you eyeball
+them. Fixes, now baked into the toolkit:
+
+- **`_shared/icon_theme.py` `recolor_svg(svg, body_hex, accents=…)`** — THE canonical recolour. Assigns
+  colour by CLASS ROLE: body classes → the native dark-mode grey (SAMPLE it, ≈`#c7c7c7`); each named-
+  accent class → its native-SAMPLED accent. Dark-theme accents are SOFTER than the kd light defaults
+  (blue `#558fec` not `#3a82f7`, green `#30ab80`, orange `#e08042`, red `#e75560`) — sample from the
+  native crop, don't trust the kd `#hex`. Handles both the raw `var(--…,fallback)` and hardcoded forms.
+  Call it at BUILD time (the WPS `build_tools.py` recolours every `icons/*.svg` on each run).
+- **`_shared/icon_match.py` `gate_icon(native_crop, replica_crop)`** — the COLOUR-AWARE gate the
+  silhouette-mask scorer (colour-blind) and whole-strip SSIM (alignment-dominated) both miss. Scores
+  shape AND samples body+accent on both sides (≤~24/ch, median-of-core so AA doesn't fool it). Locate
+  each native glyph by **template-matching the clean replica glyph over a generous window** — a fixed
+  geometry box catches label text ("Pic"/"Extr"/"Sc"). Don't stop until every icon matches shape AND
+  colour. When a glyph is the wrong RESOURCE (not just mis-coloured), re-match against the pool by eye —
+  e.g. WPS "Export to PDF" is the two-loop "P" (`ExportToPDFQat.svg`), not a doc+arrow; "Extract Text"
+  is the image-frame + blue "W" (`appcmd_kocrtool_Pic2Word`), not the all-blue extract-from-image glyph.
+- **`_shared/icon_gate.py` — THE runnable acceptance gate + Definition of Done.** Icons are where "looks
+  fine" repeatedly shipped wrong, so the verdict is a command, not a judgment. The generator emits
+  `icon_boxes.json` (`{name:[x,y,w,h]}`) and the build runs the gate as its LAST step (so it can't be
+  skipped): `python3 icon_gate.py native.png replica.png icon_boxes.json`. It template-LOCATES each
+  native glyph (slides the clean replica glyph — a fixed box catches label text), compares shape +
+  body/accent colour, writes a native|replica contact sheet (`_icon_gate.png`), and exits **0** (all
+  PASS) / **1** (gross colour FAIL — fix + rebuild) / **2** (some EYEBALL — low-confidence localize /
+  thin glyph). It's deliberately conservative — colour metrics on tiny AA'd glyphs are noisy, so it
+  hard-fails only GROSS errors (body painted the accent ≈ Δ140) and routes the rest to your eye;
+  `recolor_svg` is what makes the FIRST render correct. **DoD: icons are done only at exit 0, or exit 2
+  with every EYEBALL tile confirmed identical by eye on the contact sheet. A FAIL or an unreviewed
+  EYEBALL is never "done."** (SKILL.md steps 8b + 11.)
+
+Reference scratch: `.replicate-ui/wps/build_tools.py` (recolours via `icon_theme` at build, emits
+`icon_boxes.json`, auto-runs `icon_gate.py`), `icon_map_tools.json` (resource + sampled body/accent).

@@ -253,6 +253,18 @@ async fn extract_at_viewport_inner(
     if toon.is_empty() && html.is_empty() {
         bail!("export returned empty");
     }
+    // Build a structural Node tree from the live DOM at the click — the web
+    // counterpart to the macOS AX walk, so a Chromium/CEF surface yields the
+    // SAME `Node` shape `ax_tree` emits instead of "(none)". Best-effort: any
+    // failure just leaves ax_tree None and the export (html/toon) still stands.
+    // Bounds are viewport-relative CSS px (== points); a consumer that needs
+    // screen-space offsets by the web-content origin (see `dom_tree_at`).
+    let ax_tree = fetch_dom_tree(&mut socket, &mut next_id, viewport_x, viewport_y, 12, 600)
+        .await
+        .ok()
+        .flatten()
+        .map(|d| dom_to_node(d, 0.0, 0.0))
+        .and_then(|n| serde_json::to_string_pretty(&n).ok());
     Ok(CaptureResult {
         strategy: "cdp".into(),
         fidelity: "Pixel-perfect (runtime CDP)".into(),
@@ -260,9 +272,7 @@ async fn extract_at_viewport_inner(
         html,
         screenshot_png_b64: None,
         diagnostics: vec![],
-        // CDP captures the live DOM, not a macOS AX node tree → no structured
-        // AX tree to emit (the UI surfaces this as "(none)").
-        ax_tree: None,
+        ax_tree,
     })
 }
 
@@ -384,6 +394,217 @@ async fn probe_at_inner(
         return Ok(None);
     }
     Ok(Some(hit))
+}
+
+// ---------------------------------------------------------------------------
+// DOM → Node tree (the web/CEF counterpart to the macOS AX walk)
+// ---------------------------------------------------------------------------
+//
+// When a surface is Chromium content that AX exposes as an opaque/empty
+// `AXWebArea` (Electron, or WPS's CEF document view), the real structure IS the
+// DOM. This walks the DOM subtree at a point into the SAME `ax_macos::Node`
+// shape the AX walk produces — so component extraction / `ax_tree` works on web
+// surfaces too, with clean per-element roles, names and bounds.
+//
+// CONSTRAINT: requires the target to have been launched with
+// `--remote-debugging-port`. Apps we don't control (e.g. WPS, whose CEF host
+// exposes no such flag) can't be given one without a relaunch they don't
+// support — so this serves our own `relaunch_with_debug_port` Electron path and
+// documents the route for genuine CEF apps rather than enabling WPS directly.
+
+/// One DOM element as returned by `DOM_TREE_JS` (viewport-relative CSS px).
+#[derive(Debug, Clone, Deserialize)]
+struct DomNode {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    ident: String,
+    #[serde(default)]
+    tag: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    #[serde(default)]
+    children: Vec<DomNode>,
+}
+
+// Self-contained DOM walker. Placeholders __X__/__Y__/__MAXD__/__BUDGET__ are
+// filled by `fetch_dom_tree` (single braces — no `format!`). From the element
+// at the point it expands to the meaningful container (mirrors PROBE_JS), then
+// walks the subtree to depth __MAXD__ / __BUDGET__ visible nodes, skipping
+// zero-area and non-rendered elements. Returns a nested {role,name,ident,tag,
+// x,y,w,h,children} tree, or null.
+const DOM_TREE_JS: &str = r#"(function(){
+  try{
+    var x=__X__, y=__Y__, MAXD=__MAXD__, BUDGET=__BUDGET__, count=0;
+    var start=document.elementFromPoint(x,y);
+    if(!start) return null;
+    function expand(el){
+      var tag=(el.tagName||'').toLowerCase();
+      if(['div','section','article','aside','nav','header','footer','main','form','fieldset','ul','ol','table','tbody','thead','tr'].indexOf(tag)>=0) return el;
+      if(['input','select','textarea','button','a','span','img','svg','label','i','em','strong','p','h1','h2','h3','h4','h5','h6'].indexOf(tag)<0) return el;
+      var sr=el.getBoundingClientRect(); var startArea=sr.width*sr.height; if(!startArea) return el;
+      var maxA=window.innerWidth*window.innerHeight*0.4, minG=1.2;
+      var cur=el.parentElement, depth=0;
+      while(cur&&cur!==document.body&&cur!==document.documentElement&&depth<8){
+        var cr=cur.getBoundingClientRect(); var cA=cr.width*cr.height;
+        if(cA>maxA) break;
+        if(cA<startArea*minG){cur=cur.parentElement;depth++;continue;}
+        var cs=getComputedStyle(cur);
+        var distinct=(cs.backgroundColor&&cs.backgroundColor!=='rgba(0, 0, 0, 0)'&&cs.backgroundColor!=='transparent')||parseFloat(cs.borderTopWidth)>0||parseFloat(cs.borderTopLeftRadius)>0||(cs.boxShadow&&cs.boxShadow!=='none')||parseFloat(cs.paddingTop)>=4;
+        var structural=['form','fieldset','label','li','tr','article','section','header','footer','aside','nav'].indexOf((cur.tagName||'').toLowerCase())>=0;
+        if(distinct||structural) return cur;
+        cur=cur.parentElement;depth++;
+      }
+      return el;
+    }
+    function role(el){
+      var r=el.getAttribute&&el.getAttribute('role'); if(r) return r;
+      var t=(el.tagName||'').toLowerCase();
+      var m={button:'AXButton',a:'AXLink',input:'AXTextField',textarea:'AXTextArea',img:'AXImage',svg:'AXImage',select:'AXPopUpButton',nav:'AXGroup',main:'AXGroup',header:'AXGroup',footer:'AXGroup',ul:'AXList',ol:'AXList',li:'AXListItem',table:'AXTable',tr:'AXRow',td:'AXCell',th:'AXCell',h1:'AXHeading',h2:'AXHeading',h3:'AXHeading',h4:'AXHeading',h5:'AXHeading',h6:'AXHeading',p:'AXStaticText',label:'AXStaticText',span:'AXStaticText'};
+      return m[t]||'AXGroup';
+    }
+    function nm(el){
+      var n=(el.getAttribute&&(el.getAttribute('aria-label')||el.getAttribute('alt')||el.getAttribute('title')))||'';
+      if(!n){var t='';for(var c=el.firstChild;c;c=c.nextSibling){if(c.nodeType===3)t+=c.nodeValue;}n=t.trim().slice(0,80);}
+      return n;
+    }
+    function ident(el){return ((el.id||(el.getAttribute&&el.getAttribute('data-qa'))||'')+'').slice(0,60);}
+    function walk(el,depth){
+      if(count>=BUDGET) return null;
+      var r=el.getBoundingClientRect();
+      if(r.width<1||r.height<1) return null;
+      var cs=getComputedStyle(el);
+      if(cs.visibility==='hidden'||cs.display==='none') return null;
+      count++;
+      var node={role:role(el),name:nm(el),ident:ident(el),tag:(el.tagName||'').toLowerCase(),x:r.left,y:r.top,w:r.width,h:r.height,children:[]};
+      if(depth<MAXD){
+        for(var c=el.firstElementChild;c;c=c.nextElementSibling){
+          var t=(c.tagName||'').toLowerCase();
+          if(t==='script'||t==='style'||t==='meta'||t==='link'||t==='noscript') continue;
+          var ch=walk(c,depth+1);
+          if(ch) node.children.push(ch);
+          if(count>=BUDGET) break;
+        }
+      }
+      return node;
+    }
+    return walk(expand(start),0);
+  }catch(e){ return null; }
+})()"#;
+
+/// Convert a DOM subtree to an `ax_macos::Node`, offsetting each viewport rect
+/// by `(ox, oy)` (the web-content origin, in points) to get screen-space
+/// bounds; pass `(0,0)` to keep viewport-relative. `child_source: "CDP-DOM"`
+/// marks every node's provenance (this came from the DOM, not AX).
+fn dom_to_node(d: DomNode, ox: f64, oy: f64) -> crate::ax_macos::Node {
+    crate::ax_macos::Node {
+        role: if d.role.is_empty() { "AXGroup".into() } else { d.role },
+        subrole: None,
+        name: d.name,
+        identifier: (!d.ident.is_empty()).then_some(d.ident),
+        value: None,
+        role_description: (!d.tag.is_empty()).then_some(d.tag),
+        bounds: Some(crate::capture::ScreenRect {
+            x: d.x + ox,
+            y: d.y + oy,
+            w: d.w,
+            h: d.h,
+        }),
+        bg: None,
+        child_source: Some("CDP-DOM".into()),
+        children: d
+            .children
+            .into_iter()
+            .map(|c| dom_to_node(c, ox, oy))
+            .collect(),
+    }
+}
+
+/// Run `DOM_TREE_JS` over an already-open socket and parse the result. Shared
+/// by `extract_at_viewport` (reuses its session) and `dom_tree_at` (own
+/// connection). `Ok(None)` = nothing meaningful under the point.
+async fn fetch_dom_tree<S>(
+    socket: &mut S,
+    next_id: &mut u64,
+    vx: f64,
+    vy: f64,
+    max_depth: u32,
+    max_nodes: u32,
+) -> Result<Option<DomNode>>
+where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    *next_id += 1;
+    let expr = DOM_TREE_JS
+        .replace("__X__", &format!("{:.2}", vx))
+        .replace("__Y__", &format!("{:.2}", vy))
+        .replace("__MAXD__", &max_depth.to_string())
+        .replace("__BUDGET__", &max_nodes.to_string());
+    let res = eval(
+        socket,
+        CdpCommand {
+            id: *next_id,
+            method: "Runtime.evaluate".to_string(),
+            params: json!({"expression": expr, "returnByValue": true}),
+        },
+    )
+    .await?;
+    let val = res
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if val.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(val).context("parse DomNode tree")?))
+}
+
+/// Build a structural [`crate::ax_macos::Node`] tree from the live DOM at
+/// viewport `(vx, vy)`, expanded to the meaningful container — a standalone
+/// (own-connection) entry point mirroring [`probe_at`]. `origin` is the
+/// screen-space top-left (points) of the web viewport, added to each element's
+/// rect so bounds are screen-space. `Ok(None)` = nothing under the point. 5s
+/// hard timeout.
+pub async fn dom_tree_at(
+    port: u16,
+    target_index: usize,
+    vx: f64,
+    vy: f64,
+    origin: (f64, f64),
+    max_depth: u32,
+    max_nodes: u32,
+) -> Result<Option<crate::ax_macos::Node>> {
+    let inner = async {
+        let ws_url = discover_target(port, target_index).await?;
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), connect_async(&ws_url))
+            .await
+            .map_err(|_| anyhow!("CDP WS connect timed out (3s)"))?
+            .context("CDP WS connect")?;
+        let mut next_id: u64 = 1;
+        call(
+            &mut socket,
+            CdpCommand {
+                id: next_id,
+                method: "Runtime.enable".to_string(),
+                params: json!({}),
+            },
+        )
+        .await?;
+        let dom = fetch_dom_tree(&mut socket, &mut next_id, vx, vy, max_depth, max_nodes).await?;
+        let _ = socket.close(None).await;
+        Ok::<_, anyhow::Error>(dom.map(|d| dom_to_node(d, origin.0, origin.1)))
+    };
+    match tokio::time::timeout(Duration::from_secs(5), inner).await {
+        Ok(r) => r,
+        Err(_) => bail!("CDP dom_tree_at timed out (5s)"),
+    }
 }
 
 /// Harvest pixel-perfect assets (fonts, icon glyphs, images) from a running

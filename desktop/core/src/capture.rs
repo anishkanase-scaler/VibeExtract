@@ -2,6 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The pick-time AX subtree type carried by [`PickedElement::ax_tree`]. On macOS it is
+/// the real typed [`crate::ax_macos::Node`] (held in RAM, serialized inline into
+/// `last-selection.json`); off-macOS — where the picker never produces one — it degrades
+/// to opaque JSON so the cross-platform struct still compiles.
+#[cfg(target_os = "macos")]
+pub type AxTree = crate::ax_macos::Node;
+#[cfg(not(target_os = "macos"))]
+pub type AxTree = serde_json::Value;
+
 /// A point in screen coordinates (AX coord space: top-left origin, points).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ScreenPoint {
@@ -82,6 +91,14 @@ pub struct PickedElement {
     /// the pick-time capture failed (best-effort) or for older records.
     #[serde(default)]
     pub crop_path: Option<String>,
+    /// Full AX subtree rooted at the picked element, captured AT PICK-TIME while the
+    /// target app was running (before any freeze). Lets `get_selection` → `/replicate-ui`
+    /// use the element's structure even after the app is closed/backgrounded, instead of
+    /// a live `ax_subtree_at_point` that needs the app present. `None` for shallow
+    /// (Electron) picks — use the CDP/`extract_component` path — for trees over the node
+    /// cap, when the pick-time walk failed (best-effort), or for older records.
+    #[serde(default)]
+    pub ax_tree: Option<AxTree>,
 }
 
 #[cfg(test)]

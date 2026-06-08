@@ -117,10 +117,11 @@ Everything after this section is the detailed loop that implements these four pi
    at the click as below (this needs the app still running).
 
    - **Healthy AX pick** (`ax_shallow` is false **and** role isn't AXMenuBar/AXApplication/AXWindow):
-     use its `bounds` (points, top-left) for structure — `ax_subtree_at_point { x: bounds.x+bounds.w/2,
-     y: bounds.y+bounds.h/2 }` for roles/structure, the element's `crop_path` (else
-     `screenshot_region { x,y,w,h }`=`bounds`) for the native reference, `extract_component { x, y }`
-     for a DOM/CSS head-start.
+     PREFER the element's stored **`ax_tree`** from `get_selection` for roles/structure — it's the
+     pick-time subtree and stays valid even after the app is closed/switched; only if `ax_tree` is
+     null fall back to the live `ax_subtree_at_point { x: bounds.x+bounds.w/2, y: bounds.y+bounds.h/2 }`.
+     Use the element's `crop_path` (else `screenshot_region { x,y,w,h }`=`bounds`) for the native
+     reference, `extract_component { x, y }` for a DOM/CSS head-start.
    - **Shallow AX pick** (`ax_shallow` is true, or role ∈ {AXMenuBar, AXApplication, AXWindow}): the
      native AX tree couldn't see the real element — normal for **Electron** apps (Slack, VS Code),
      whose web content isn't exposed to AX. **Do NOT use `bounds`** (it's a click-centred placeholder,
@@ -165,8 +166,9 @@ Everything after this section is the detailed loop that implements these four pi
 
    **SAVE THE AX TREE — it's a deliverable, not scratch.** Write the `ax_tree` result
    verbatim to `.replicate-ui/<app>/ax_tree.json` (pretty JSON). In **component mode**
-   (2b), save each picked element's `ax_subtree_at_point` result — either one file or a
-   JSON array `[{element, role, name, ax_tree}, …]`. This file is the **canonical
+   (2b), the per-element **`ax_tree`** returned by `get_selection` is ALREADY the pick-time subtree —
+   write THAT to `ax_tree.json` (no separate `ax_subtree_at_point` call needed unless it's null).
+   This file is the **canonical
    semantic spec** of the UI (every control's role/name/value/bounds/children); the
    replica's HTML carries the same data inline (step 6), and `ax_tree.html` (step 10)
    renders it. (No AX tree for pure-CDP/Electron captures — that's honest; don't fake one.)
@@ -181,6 +183,12 @@ Everything after this section is the detailed loop that implements these four pi
      **icons/SVGs/images** from this run's harvest, not a prior run's pixels.
    - If the target is **Electron without a debug port**, *offer* `relaunch_with_debug_port` to
      enable the harvest — do **not** fall back to drawing.
+   - **DEFAULT per-icon sequence — do ALL of this on the FIRST pass (don't wait for the dev to flag a
+     wrong icon):** (1) resolve the resource (`.kui`/pool + `icon_match.match` visual prior); (2)
+     **recolour by CLASS ROLE** via `icon_theme.recolor_svg` — body→native grey, named-accent→accent,
+     NEVER one-colour-per-icon; (3) **SAMPLE** the body grey + each accent from the fresh native crop and
+     bake them (dark accents are softer than kd defaults); (4) run the **icon gate** (step 8b) and
+     auto-iterate until clean. Getting (2)+(3) right on attempt 1 is what makes the first render correct.
    - **Icon selection is VISUAL-MATCH-DRIVEN + LOCKED (use `icon_match`; name-matching alone
      whack-a-moles).** Pipeline: `resource_extract.extract_pool(app_path)` → the app's full real-icon
      pool; then per control `icon_match.match(native_crop, pool, idx, name_prior=<.kui/AX/data-qa>,
@@ -212,13 +220,26 @@ Everything after this section is the detailed loop that implements these four pi
          (`/icons_svg/24x24/FormatPainter.svg`,`Shapes.svg`,`Fill.svg`,`OutLine.svg`,`ShapeEffect.svg`,
          `Group.svg`,`BringForward.svg`,`SelectObjects.svg`…).
        • **Loose files**: `Contents/Resources/**` png/svg/`.icns` dirs, theme/skin folders.
-     **Prefer SVG** (vector → crisp at the measured size). Theme-aware vectors keep the glyph colour in
-     a `<style>` class (`.colorBlackStroke{fill:#333840}` / kdesign `var(--kd-color-icon-primary,#333333)`)
-     with accents in sibling classes (`.colorOrangeStroke #DC5513`, blues). **Recolour the monochrome
-     glyph to the theme** (dark bar → light grey ~native sample) and KEEP accents; for a control native
-     draws fully monochrome, force every colour grey. Replace `#333333` BEFORE `#333` (substring trap),
-     and replace `currentColor`/CSS-var fallbacks — when used via `<img src>` the colour MUST be baked
-     into the file (it can't inherit). Place each icon at its **measured glyph box** (step 6).
+     **Prefer SVG** (vector → crisp at the measured size). Theme-aware vectors keep the glyph in a
+     `<style>` whose **BODY** class is theme-following (`kd-color-icon-primary` / `.colorBlackStroke` /
+     `var(--kd-color-icon-primary,#333333)`) and whose **ACCENT** lives in a sibling NAMED class
+     (`kd-color-icon-blue-primary`, `.colorOrangeStroke #DC5513`). 🚫 **NEVER recolour with ONE colour
+     per icon** — that paints the BODY in the accent colour (a fully-blue document instead of grey-doc +
+     blue badge). It's invisible on monochrome icons and only bites accented ones, so it hides until you
+     eyeball them (this was a real regression on PDF→Word/Excel/PPT/Picture-to-PDF). Use the canonical
+     **`_shared/icon_theme.recolor_svg(svg, body_hex, accents=…)`**: BODY classes → the native dark-mode
+     grey (SAMPLE it, ≈`#c7c7c7`), each NAMED-accent class → its native-SAMPLED accent (dark-theme accents
+     are SOFTER than the kd light defaults — e.g. blue `#558fec` not `#3a82f7`; sample, don't assume).
+     Colours MUST be baked (an `<img src>` SVG can't inherit; qlmanage/Chromium ignore CSS vars). Run the
+     recolour at BUILD time so no icon can ship mis-coloured. Place each icon at its **measured glyph box** (step 6).
+   - 🚦 **MANDATORY colour-aware icon gate — don't stop until it passes.** The silhouette-mask scorer is
+     COLOUR-BLIND and whole-strip SSIM is alignment-dominated — BOTH miss a wrong body colour or wrong
+     accent. After placing icons, run **`_shared/icon_match.gate_icon(native_crop, replica_crop)`** per
+     icon: it scores shape AND samples body+accent on BOTH sides (≤~24/ch). Template-locate each native
+     glyph by sliding the (clean) replica glyph over a generous window — NEVER trust a fixed box (it
+     catches label text: "Pic"/"Extr"/"Sc"). Re-pick/recolour every failure and re-run until each icon
+     matches in shape AND colour. This is the *separate icon accuracy predictor*; a low whole-strip SSIM
+     is never an excuse to ship a wrong icon.
    - **Screenshot-crop = per-icon LAST RESORT**, only when an element genuinely has NO resource file —
      a *runtime-rendered/dynamic* preview (WPS's "Abc" shape-style thumbnails, a slide thumbnail, an
      avatar). Then crop the real pixels (`key_bg`/transparent-key) — never hand-draw — and SAY in the
@@ -407,6 +428,21 @@ Everything after this section is the detailed loop that implements these four pi
    Report per region: icons measured (max px Δ), colour samples (count, max channel Δ), decorations
    (found / reproduced). Only after all three pass for every region do step 9's stop criteria apply.
 
+8b. **ICON ACCEPTANCE GATE (HARD + RUNNABLE — the icon part of "done").** Icons are where "looks fine"
+   repeatedly shipped wrong, so this is not judgment — it's a command you MUST run and show. Your
+   generator emits **`icon_boxes.json`** (`{name:[x,y,w,h]}` — each icon's box in the render; you know
+   every position) and renders the replica at the native region's point size, then runs
+   **`python3 "<skill-base>/_shared/icon_gate.py" <native>.png <replica>.png icon_boxes.json`** (wire it
+   as the LAST step of the build so it can't be skipped — see `.replicate-ui/wps/build_tools.py`). The
+   gate template-LOCATES each native glyph (slides the clean replica glyph — never a fixed box, which
+   catches label text), compares shape + body/accent colour, writes a native|replica **contact sheet**
+   (`_icon_gate.png`), and exits: **0** all PASS · **1** a gross colour FAIL (fix + rebuild) · **2** some
+   EYEBALL (low-confidence localize / low shape / thin glyph). 🚦 **You may only treat icons as done when
+   the gate is exit 0, OR exit 2 with EVERY `EYEBALL` tile confirmed identical by your own eye on the
+   contact sheet.** A `FAIL` is never "done"; an unreviewed `EYEBALL` is never "done". (The gate is
+   deliberately conservative on tiny AA'd glyphs — colour metrics are noisy, so it hard-fails only gross
+   errors and routes the rest to your eye; the recolour step in 3b is what makes the FIRST render correct.)
+
 9. **Iterate — YOURSELF, to the bar. The dev picks once and never iterates.** If `pass` is false
    (score < 0.92): inspect the heatmap, fix the HTML/CSS for the highlighted regions, re-render,
    re-diff. **Run EVERY iteration autonomously** — re-sampling colours, re-slicing sprites, and
@@ -457,8 +493,11 @@ Everything after this section is the detailed loop that implements these four pi
     `index.html` carries `data-ax-*` (built via `markup.el_from_node`). The output is a complete
     semantic spec — visual + structure — not just a picture.
 
-    **You may only say "done" after the STACKED native-over-replica comparison (step 8) passes your
-    eye region-by-region.** For native-app replicas, that audit explicitly confirms: every icon came
+    **You may only say "done" after (a) the runnable ICON GATE (step 8b) is clean — exit 0, or exit 2
+    with every EYEBALL tile confirmed by eye — AND (b) the STACKED native-over-replica comparison (step
+    8) passes your eye region-by-region.** Never report done while any icon isn't identical to native;
+    "diminishing returns" / "SSIM text-capped" / "good enough" are NEVER reasons to ship a wrong icon.
+    For native-app replicas, that audit explicitly confirms: every icon came
     from the catalog (or a real crop) and sits at its **measured glyph box**; **chevrons exactly match
     the AX roles** (AXMenuButton only); greyed/disabled states are dimmed; steppers/sub-labels align in
     columns; the Share/accent button uses the **real glyph + sampled colour** (never hand-drawn). The

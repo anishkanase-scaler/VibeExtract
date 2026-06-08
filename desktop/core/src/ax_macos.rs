@@ -553,6 +553,7 @@ pub fn pick_in_app(point: ScreenPoint, app_pid: i32) -> Result<PickedElement> {
         click: Some(point),
         ax_shallow,
         crop_path: None,
+        ax_tree: None,
     })
 }
 
@@ -567,21 +568,11 @@ pub fn pick_in_app(point: ScreenPoint, app_pid: i32) -> Result<PickedElement> {
 pub fn deepen_at(start: AxElement, point: ScreenPoint) -> AxElement {
     let mut current = start;
     for _ in 0..40 {
-        // Try several children attributes — Electron / Chromium AX trees
-        // sometimes hide content under AXContents rather than AXChildren.
-        let kids = {
-            let v = current.array_attr("AXVisibleChildren");
-            if !v.is_empty() {
-                v
-            } else {
-                let c = current.array_attr("AXChildren");
-                if !c.is_empty() {
-                    c
-                } else {
-                    current.array_attr("AXContents")
-                }
-            }
-        };
+        // Try several children attributes — Electron / Chromium AX trees and
+        // tables/outlines hide content under AXContents / AXRows / AXSections
+        // rather than AXChildren. Shared with `capture_node` so the picker
+        // descends as deeply as the tree walk does.
+        let (kids, _) = enumerate_children(&current);
         // Find the child whose bounds tightly contain the point. If multiple
         // children match (e.g. overlapping), pick the smallest-area one — that
         // generally corresponds to the most specific leaf.
@@ -705,6 +696,7 @@ pub fn pick(point: ScreenPoint) -> Result<PickedElement> {
         click: Some(point),
         ax_shallow,
         crop_path: None,
+        ax_tree: None,
     })
 }
 
@@ -740,6 +732,13 @@ pub struct Node {
     pub bounds: Option<ScreenRect>,
     /// Filled in by the sampling pass.
     pub bg: Option<(u8, u8, u8)>,
+    /// Which AX relation produced this node's children when it wasn't the
+    /// obvious AXChildren/AXVisibleChildren — e.g. "AXRows", "AXContents",
+    /// "AXSections", or an "empty:…" honesty marker for an AX-opaque web
+    /// surface. `None` for the common case. Surfaces *where* structure came
+    /// from (or why it's missing) instead of a mysteriously flat tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_source: Option<String>,
     pub children: Vec<Node>,
 }
 
@@ -771,18 +770,21 @@ fn capture_node(el: &AxElement, depth: u32, max_depth: u32) -> Node {
     let bounds = el.rect();
 
     let mut children = Vec::new();
+    let mut child_source: Option<String> = None;
     if depth < max_depth {
-        let kids = {
-            let visible = el.array_attr("AXVisibleChildren");
-            if !visible.is_empty() {
-                visible
-            } else {
-                el.array_attr("AXChildren")
-            }
-        };
+        let (kids, rel) = enumerate_children(el);
+        child_source = rel.map(|r| r.to_string());
         for kid in &kids {
             children.push(capture_node(kid, depth + 1, max_depth));
         }
+    }
+    // Honesty marker: a web surface that exposed NO children through ANY
+    // relation is Chromium/CEF content AX can't see — the real structure lives
+    // in the DOM and needs CDP. Flag it so a flat tree reads as "opaque here"
+    // rather than a mysterious empty leaf. (Restricted to AXWebArea; an empty
+    // AXGroup is too common to be a reliable signal.)
+    if children.is_empty() && depth < max_depth && role == "AXWebArea" {
+        child_source = Some("empty:web-content-opaque-to-AX (needs CDP)".into());
     }
 
     Node {
@@ -794,12 +796,93 @@ fn capture_node(el: &AxElement, depth: u32, max_depth: u32) -> Node {
         role_description,
         bounds,
         bg: None,
+        child_source,
         children,
     }
 }
 
+/// Enumerate an element's child elements, trying the standard relations first
+/// and then the less-common ones some apps hide structure behind. Returns the
+/// children plus the relation name when it WASN'T the obvious AXChildren /
+/// AXVisibleChildren (so `capture_node` can record where structure came from).
+///
+/// Stops at the first non-empty relation — rows/contents are frequently ALSO
+/// listed under AXChildren, so merging would double-count. The fallbacks
+/// (AXContents = scroll areas; AXRows = tables/outlines/lists; AXSections =
+/// web/structured documents) are why a previously-flat extraction now descends
+/// into tables and scroll containers instead of stopping at the container.
+fn enumerate_children(el: &AxElement) -> (Vec<AxElement>, Option<&'static str>) {
+    let visible = el.array_attr("AXVisibleChildren");
+    if !visible.is_empty() {
+        return (visible, None);
+    }
+    let children = el.array_attr("AXChildren");
+    if !children.is_empty() {
+        return (children, None);
+    }
+    for rel in ["AXContents", "AXRows", "AXSections"] {
+        let kids = el.array_attr(rel);
+        if !kids.is_empty() {
+            return (kids, Some(rel));
+        }
+    }
+    (Vec::new(), None)
+}
+
 pub fn count_nodes(n: &Node) -> usize {
     1 + n.children.iter().map(count_nodes).sum::<usize>()
+}
+
+/// Grow from `el` to its sibling BAND — the run of same-parent children that share
+/// `current`'s horizontal row (vertical overlap with `current` AND similar height).
+/// Returns the band's bounding rect + each member's subtree (depth `max_depth`, ordered
+/// left-to-right) so the caller can build a synthetic group. Returns `None` when there's
+/// no real band (<2 members), the band ≈ the element, or the band ≈ the parent (so it
+/// never duplicates an existing ↑ step). This is what lets ↑ select "the whole toolbar
+/// row" in FLAT trees — e.g. WPS, whose ribbon tabs are direct `AXWindow` children with
+/// no row container, so a plain parent-walk would jump straight to the window.
+pub fn sibling_band(el: &AxElement, current: &ScreenRect, max_depth: u32) -> Option<(ScreenRect, Vec<Node>)> {
+    if current.w < 1.0 || current.h < 1.0 {
+        return None;
+    }
+    let parent = el.parent()?;
+    let parent_rect = parent.rect();
+    let (cy0, cy1) = (current.y, current.y + current.h);
+    // Same-row siblings: vertical overlap > 50% of the current height AND similar height.
+    let mut kept: Vec<(f64, AxElement, ScreenRect)> = Vec::new();
+    for k in parent.array_attr("AXChildren") {
+        let Some(r) = k.rect() else { continue };
+        if r.w < 1.0 || r.h < 1.0 {
+            continue;
+        }
+        let overlap = (r.y + r.h).min(cy1) - r.y.max(cy0);
+        let height_similar = (r.h - current.h).abs() <= current.h * 0.6;
+        if overlap > current.h * 0.5 && height_similar {
+            kept.push((r.x, k, r));
+        }
+    }
+    if kept.len() < 2 {
+        return None;
+    }
+    let minx = kept.iter().map(|(_, _, r)| r.x).fold(f64::INFINITY, f64::min);
+    let miny = kept.iter().map(|(_, _, r)| r.y).fold(f64::INFINITY, f64::min);
+    let maxx = kept.iter().map(|(_, _, r)| r.x + r.w).fold(f64::NEG_INFINITY, f64::max);
+    let maxy = kept.iter().map(|(_, _, r)| r.y + r.h).fold(f64::NEG_INFINITY, f64::max);
+    let band = ScreenRect { x: minx, y: miny, w: maxx - minx, h: maxy - miny };
+    // Must be meaningfully wider than the single element …
+    if band.w < current.w * 1.5 {
+        return None;
+    }
+    // … and not essentially the whole parent (else this is just the parent step).
+    if let Some(p) = parent_rect {
+        let pa = p.w * p.h;
+        if pa > 0.0 && band.w * band.h >= 0.9 * pa {
+            return None;
+        }
+    }
+    kept.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let nodes: Vec<Node> = kept.iter().map(|(_, k, _)| walk_node(k, max_depth)).collect();
+    Some((band, nodes))
 }
 
 // --- Root walks (app / window) -----------------------------------------------

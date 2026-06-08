@@ -120,7 +120,7 @@
     /* Top-of-screen instruction strip — glassmorphic celestial pill */
     .hud {
       position: fixed;
-      top: 40px;
+      bottom: 40px;
       left: 50%;
       transform: translateX(-50%);
       background:
@@ -146,6 +146,10 @@
       align-items: center;
       gap: 8px;
     }
+    /* When the cursor is in the BOTTOM half, flip the HUD to the top so it never
+       sits under what you're inspecting (the top toolbar is the common target, so
+       the default above is bottom-anchored). */
+    .hud.at-top { top: 40px; bottom: auto; }
     .hud strong {
       background: linear-gradient(135deg, #f5f3ff, #a78bfa 60%, #60a5fa);
       -webkit-background-clip: text;
@@ -191,12 +195,16 @@
   <div id="hover-outline" class="outline hover" style="display: none;"></div>
   <div id="hover-label" class="outline-label hover" style="display: none;"></div>
   <div id="selected-container"></div>
+  <!-- Centered banner shown while the target app is intentionally paused (SIGSTOP) for
+       ↑/↓ refinement, so the freeze reads as deliberate rather than a crash. -->
+  <div id="status-banner" style="display:none; position:fixed; bottom:88px; left:50%; transform:translateX(-50%); z-index:30; padding:8px 16px; border-radius:10px; background:rgba(20,20,22,0.92); color:#fde68a; font:600 13px/1.35 -apple-system,system-ui,sans-serif; box-shadow:0 4px 18px rgba(0,0,0,0.45); pointer-events:none; white-space:nowrap;"></div>
   <div class="hud">
     <strong>VibeExtract</strong>
     &nbsp;·&nbsp; <span id="hover-readout" style="opacity: 0.85;">hover an element…</span>
     &nbsp;·&nbsp; <kbd>Click</kbd> select &nbsp;·&nbsp;
     <kbd>⇧</kbd>+<kbd>Click</kbd> add &nbsp;·&nbsp;
-    <kbd>⌘</kbd><kbd>⇧</kbd><kbd>E</kbd> export &nbsp;·&nbsp;
+    <kbd>↑</kbd><kbd>↓</kbd> resize &nbsp;·&nbsp;
+    <kbd>Enter</kbd> lock &nbsp;·&nbsp;
     <kbd>Esc</kbd> cancel
     <span class="count" id="sel-count">0 selected</span>
   </div>
@@ -238,7 +246,9 @@
       el.style.height = r.height + 'px';
       labelEl.style.display = 'block';
       labelEl.style.left = r.left + 'px';
-      labelEl.style.top = Math.max(0, r.top - 22) + 'px';
+      // Near the top edge (menu bar / title bar / toolbar), put the label BELOW the
+      // element instead of above so it doesn't cover the chrome.
+      labelEl.style.top = (r.top < 50 ? r.top + r.height + 4 : r.top - 22) + 'px';
       labelEl.textContent = label || '';
     }
 
@@ -286,6 +296,9 @@
 
       if (cursor && typeof cursor.x === 'number') {
         moveCrosshair(cursor.x, cursor.y);
+        // Keep the info box on the opposite half from the cursor so it never covers
+        // the element you're inspecting (e.g. the top toolbar).
+        document.querySelector('.hud')?.classList.toggle('at-top', cursor.y > window.innerHeight / 2);
       }
 
       if (bounds && bounds.w > 0 && bounds.h > 0) {
@@ -306,6 +319,24 @@
     listen('overlay-hide', () => {
       setHoverOutline(null);
       setSelections([]);
+      document.getElementById('status-banner').style.display = 'none';
+    });
+
+    // Target app isn't frontmost (user switched apps / swiped Spaces) → clear the
+    // painted outlines so they don't bleed over another app. The backend re-emits
+    // 'overlay-selections' to restore them when the target app comes back to front.
+    listen('overlay-suppress', () => {
+      setHoverOutline(null);
+      setSelections([]);
+      document.getElementById('status-banner').style.display = 'none';
+    });
+
+    // Status banner (e.g. "app paused for refine"). An empty message hides it.
+    listen('overlay-status', (event) => {
+      const banner = document.getElementById('status-banner');
+      const msg = event.payload || '';
+      banner.textContent = msg;
+      banner.style.display = msg ? 'block' : 'none';
     });
 
     // Escape closes pick mode.
