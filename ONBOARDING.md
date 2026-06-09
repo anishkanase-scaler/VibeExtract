@@ -19,7 +19,7 @@ Two pieces work together:
 
 ## 1. Install the app
 
-1. Copy `VibeExtract Desktop_0.2.0_aarch64.dmg` (from the shared drive) and open it.
+1. **Airdrop** (or copy) `VibeExtract Desktop_0.2.0_aarch64.dmg`, then open it.
 2. Drag **VibeExtract Desktop** into `/Applications`.
 3. **First launch:** the app is internally **self-signed** (not from the App Store / not
    notarized), so macOS will block a normal double-click. **Right-click the app → Open → Open**
@@ -51,37 +51,33 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8765/mcp   # 406 = up 
 `406` means the server is running (it only speaks the MCP protocol). To disable autostart for
 local debugging, launch with `VIBE_MCP_NO_AUTOSTART=1`.
 
-## 4. Install the skill (no repo clone needed)
+## 4. `/replicate-ui` — the app installs it for you
 
-The skill is **self-contained** — it carries its whole toolkit in `_shared/`. You do **not** need
-this repo or any per-app scripts.
+**You no longer copy any folders or run `claude mcp add`.** The VibeExtract app **bundles the
+`/replicate-ui` skill inside itself** and, on launch, automatically:
 
-1. Copy the **`replicate-ui/` skill folder** into your Claude Code skills directory:
-   - globally → `~/.claude/skills/replicate-ui/` (usable from every project), or
-   - per-project → `<your-project>/.claude/skills/replicate-ui/`.
+- copies the skill into `~/.claude/skills/replicate-ui` (so it works in every project), and
+- registers the two MCP servers in your user config (`~/.claude.json`): `vibe-extract` (the live
+  app URL) + `playwright` (the renderer). It **merges** — your existing MCP servers are untouched,
+  and it makes a one-time backup at `~/.claude.json.vibe-backup`.
 
-   It contains `SKILL.md` + `_shared/` (`role-map.json`, `interactive.css`, `markup.py`,
-   `sprite.py`, `gridtext.py`, `vision_ocr.swift`, `cache.py`) — everything the skill needs.
-2. Register the two MCP servers Claude uses — add a `.mcp.json` to your project (or `claude mcp add`):
-  - `vibe-extract` → `http://127.0.0.1:8765/mcp` (the app)
-  - `playwright` → headless Chromium for rendering replicas (`npx @playwright/mcp`)
+So the whole setup is just: **open the app once → restart Claude Code → run `/replicate-ui`.**
 
-  Edit the playwright `--output-dir` in `.mcp.json` to a path on **your** machine.
+There's a **"Set up /replicate-ui for Claude Code"** button in the app (under the MCP panel) to
+re-run/repair this anytime; it also tells you if a prerequisite is missing.
+
+**Two prerequisites it can't install for you** (it detects + points you to them):
+- **Claude Code** itself, signed in.
+- **Node.js** (https://nodejs.org) — used by the `playwright` renderer (`npx`). Python 3 ships with
+  macOS; the app best-effort-installs the one Python lib it needs (Pillow).
 
 > **Outputs are scratch.** Each replica (its `index.html`, harvested `assets/`, screenshots, sprite
-> cache) is written to `.replicate-ui/<app>/` in your current working directory. Gitignore it and
-> delete it anytime — it's fully regenerable; only the skill (with `_shared/`) needs to persist.
+> cache) is written to `.replicate-ui/<app>/` in your current working directory — gitignore it and
+> delete it anytime; it's fully regenerable.
 
-Register the servers (if not picked up from `.mcp.json` automatically):
-
-```bash
-claude mcp add --transport http vibe-extract http://127.0.0.1:8765/mcp
-claude mcp list      # both vibe-extract and playwright should be connected
-```
-
-> **After you restart the VibeExtract app, reconnect the MCP in Claude:** run `/mcp` → select
-> `vibe-extract` → reconnect. The server restarts with the app, so Claude's old connection goes
-> stale until you reconnect.
+> **After you restart the VibeExtract app, reconnect the MCP in Claude:** run `/mcp` → `vibe-extract`
+> → reconnect (the server restarts with the app, so the old connection goes stale). The app re-points
+> the URL to the live port on each launch, so a simple `/mcp` reconnect is all that's needed.
 
 ---
 

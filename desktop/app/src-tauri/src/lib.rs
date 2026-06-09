@@ -205,6 +205,192 @@ fn find_output_dir() -> PathBuf {
     dir
 }
 
+// ============================================================================
+// Claude Code integration — the app SELF-INSTALLS the /replicate-ui skill and
+// registers its MCP servers on launch, so distributing the .app is all anyone
+// needs (no manual ~/.claude/skills copying, no `claude mcp add`).
+// ============================================================================
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct SetupReport {
+    pub skill_installed: bool,
+    pub skill_path: String,
+    pub mcp_registered: bool,
+    pub vibe_url: String,
+    pub pillow_ok: bool,
+    pub node_ok: bool,
+    pub notes: Vec<String>,
+}
+
+/// Recursively copy a dir, skipping python/OS cruft.
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let n = name.to_string_lossy();
+        if n == "__pycache__" || n.ends_with(".pyc") || n == ".DS_Store" {
+            continue;
+        }
+        let to = dst.join(&name);
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Locate a bundled skill folder (`<name>/SKILL.md`): the .app's Resources first
+/// (shipped build), then this repo's skills dir (dev build, path baked at compile time).
+fn bundled_skill(app: &AppHandle, name: &str) -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = app.path().resource_dir() {
+        cands.push(rd.join("resources").join(name));
+        cands.push(rd.join(name));
+    }
+    cands.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../.claude/skills")
+            .join(name),
+    );
+    cands.into_iter().find(|p| p.join("SKILL.md").exists())
+}
+
+fn has_pillow() -> bool {
+    String::from_utf8_lossy(&login_shell("python3 -c 'import PIL' 2>/dev/null && echo OK")).contains("OK")
+}
+
+/// Run a command through a login shell so it sees the user's full PATH (a
+/// Finder-launched .app otherwise inherits only /usr/bin:/bin). Returns stdout bytes.
+fn login_shell(cmd: &str) -> Vec<u8> {
+    std::process::Command::new("/bin/zsh")
+        .args(["-lc", cmd])
+        .output()
+        .map(|o| o.stdout)
+        .unwrap_or_default()
+}
+
+/// Merge our MCP servers into ~/.claude.json (user scope) WITHOUT clobbering the
+/// user's other config/servers. vibe-extract -> the live url; playwright added only
+/// if absent. Order-preserving + atomic + one-time backup. Returns true if changed.
+fn register_mcp_servers(vibe_url: &str) -> Result<bool, String> {
+    use serde_json::{json, Value};
+    let path = dirs_home().join(".claude.json");
+    let mut root: Value = if path.exists() {
+        let txt = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        match serde_json::from_str(&txt) {
+            Ok(v) => v,
+            Err(e) => return Err(format!("~/.claude.json isn't valid JSON ({e}) — left untouched")),
+        }
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        return Err("~/.claude.json isn't a JSON object — left untouched".into());
+    }
+    let before = serde_json::to_string(&root).unwrap_or_default();
+    {
+        let obj = root.as_object_mut().unwrap();
+        let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
+        if !servers.is_object() {
+            *servers = json!({});
+        }
+        let s = servers.as_object_mut().unwrap();
+        s.insert("vibe-extract".to_string(), json!({"type": "http", "url": vibe_url}));
+        s.entry("playwright").or_insert_with(|| {
+            json!({"command": "npx", "args": ["@playwright/mcp@latest", "--headless", "--isolated"]})
+        });
+    }
+    if serde_json::to_string(&root).unwrap_or_default() == before {
+        return Ok(false);
+    }
+    let bak = dirs_home().join(".claude.json.vibe-backup");
+    if path.exists() && !bak.exists() {
+        let _ = std::fs::copy(&path, &bak);
+    }
+    let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    let tmp = dirs_home().join(".claude.json.vibe-tmp");
+    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Install the bundled skill(s) + register MCP + best-effort deps. Idempotent.
+fn setup_claude_integration(app: &AppHandle, mcp_url: Option<String>) -> Result<SetupReport, String> {
+    let mut notes: Vec<String> = Vec::new();
+    let skills_dir = dirs_home().join(".claude").join("skills");
+    std::fs::create_dir_all(&skills_dir).map_err(|e| e.to_string())?;
+
+    // 1) copy the skill(s) into ~/.claude/skills (overwrite so app updates refresh them)
+    let mut skill_installed = false;
+    let mut skill_path = String::new();
+    for name in ["replicate-ui", "replicate-ui-watch"] {
+        if let Some(src) = bundled_skill(app, name) {
+            let dst = skills_dir.join(name);
+            let _ = std::fs::remove_dir_all(&dst);
+            match copy_tree(&src, &dst) {
+                Ok(_) => {
+                    if name == "replicate-ui" {
+                        skill_installed = true;
+                        skill_path = dst.display().to_string();
+                    }
+                }
+                Err(e) => notes.push(format!("copy {name} failed: {e}")),
+            }
+        } else if name == "replicate-ui" {
+            notes.push("bundled replicate-ui skill not found".into());
+        }
+    }
+
+    // 2) register MCP servers (vibe-extract at the live url + playwright)
+    let vibe_url = mcp_url.unwrap_or_else(|| "http://127.0.0.1:8765/mcp".to_string());
+    let mcp_registered = match register_mcp_servers(&vibe_url) {
+        Ok(changed) => {
+            if changed {
+                notes.push("registered MCP servers in ~/.claude.json".into());
+            }
+            true
+        }
+        Err(e) => {
+            notes.push(format!("MCP registration: {e}"));
+            false
+        }
+    };
+
+    // 3) best-effort deps (don't block; just report what's missing)
+    let mut pillow_ok = has_pillow();
+    if !pillow_ok {
+        let _ = login_shell("python3 -m pip install --user --quiet Pillow");
+        pillow_ok = has_pillow();
+    }
+    if !pillow_ok {
+        notes.push("Pillow missing — run: python3 -m pip install --user Pillow".into());
+    }
+    let node_ok = !login_shell("command -v node").is_empty();
+    if !node_ok {
+        notes.push("Node.js not found — install from https://nodejs.org (for the Playwright renderer)".into());
+    }
+
+    Ok(SetupReport {
+        skill_installed,
+        skill_path,
+        mcp_registered,
+        vibe_url,
+        pillow_ok,
+        node_ok,
+        notes,
+    })
+}
+
+/// UI/manual trigger: re-run the self-install (repair).
+#[tauri::command]
+async fn install_replicate_ui_skill(app: AppHandle) -> Result<SetupReport, String> {
+    let url = app.state::<mcp::McpServerState>().snapshot().url;
+    setup_claude_integration(&app, url)
+}
+
 /// Make the overlay window appear over full-screen apps (e.g. Slack
 /// full-screen, browsers in full-screen mode).
 ///
@@ -2797,6 +2983,7 @@ pub fn run() {
             known_electron_apps,
             mcp::mcp_status,
             mcp::mcp_toggle,
+            install_replicate_ui_skill,
         ])
         .setup(|app| {
             // Freeze-recovery: point the on-disk record at the output dir, then resume
@@ -2969,12 +3156,33 @@ pub fn run() {
             // opt-out, so existing scripts keep behaving.
             let opt_out = std::env::var_os("VIBE_MCP_NO_AUTOSTART").is_some();
             let force_on = std::env::var_os("VIBE_MCP_AUTOSTART").is_some();
-            if force_on || !opt_out {
+            let do_mcp = force_on || !opt_out;
+            {
                 let h = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    match mcp::start(h).await {
-                        Ok(s) => log::info!("MCP auto-started: {:?}", s.url),
-                        Err(e) => log::error!("MCP auto-start failed: {e}"),
+                    let url = if do_mcp {
+                        match mcp::start(h.clone()).await {
+                            Ok(s) => {
+                                log::info!("MCP auto-started: {:?}", s.url);
+                                s.url
+                            }
+                            Err(e) => {
+                                log::error!("MCP auto-start failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // Self-install the /replicate-ui skill + register MCP (idempotent).
+                    match setup_claude_integration(&h, url) {
+                        Ok(r) => log::info!(
+                            "claude integration (skill={}, mcp={}): {:?}",
+                            r.skill_installed,
+                            r.mcp_registered,
+                            r.notes
+                        ),
+                        Err(e) => log::warn!("claude integration failed: {e}"),
                     }
                 });
             }

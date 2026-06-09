@@ -775,6 +775,12 @@
         <div class="row" id="mcp-url-row" style="display:none;"><span>URL</span><span class="v" id="mcp-url" style="font-size:11px;">—</span></div>
         <button id="mcp-toggle" class="secondary">Start MCP server</button>
         <button id="mcp-copy" class="secondary" style="display:none;">Copy connect command</button>
+        <hr style="border:none;border-top:1px solid var(--border, #333);margin:10px 0;">
+        <div class="row" style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:block;line-height:1.4;">
+          Installs the <b>/replicate-ui</b> command into Claude Code (skill + MCP config). Runs automatically on launch — use this to re-run/repair.
+        </div>
+        <button id="setup-skill" class="secondary">Set up /replicate-ui for Claude Code</button>
+        <div class="row" id="setup-status" style="display:none;font-size:11px;line-height:1.4;margin-top:6px;"></div>
       </section>
     </aside>
 
@@ -1345,6 +1351,33 @@
       });
 
       invoke('mcp_status').then(render).catch((e) => console.warn('mcp_status', e));
+
+      // --- /replicate-ui self-install ---
+      const setupBtn = document.getElementById('setup-skill');
+      const setupStatus = document.getElementById('setup-status');
+      if (setupBtn) {
+        setupBtn.addEventListener('click', async () => {
+          setupBtn.disabled = true;
+          const prev = setupBtn.textContent;
+          setupBtn.textContent = 'Setting up…';
+          setupStatus.style.display = '';
+          try {
+            const r = await invoke('install_replicate_ui_skill');
+            const lines = [];
+            lines.push((r.skill_installed ? '✓' : '✗') + ' /replicate-ui skill installed');
+            lines.push((r.mcp_registered ? '✓' : '✗') + ' MCP servers registered');
+            if (!r.node_ok) lines.push('⚠︎ Install Node.js (nodejs.org) for the renderer');
+            if (!r.pillow_ok) lines.push('⚠︎ Pillow missing (python3 -m pip install --user Pillow)');
+            lines.push('→ Restart Claude Code, then run /replicate-ui');
+            setupStatus.innerHTML = lines.join('<br>');
+          } catch (e) {
+            setupStatus.textContent = 'error: ' + e;
+          } finally {
+            setupBtn.disabled = false;
+            setupBtn.textContent = prev;
+          }
+        });
+      }
     })();
   </script>
 </body>

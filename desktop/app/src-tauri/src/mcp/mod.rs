@@ -781,7 +781,7 @@ pub struct McpStatus {
 }
 
 impl McpServerState {
-    fn snapshot(&self) -> McpStatus {
+    pub fn snapshot(&self) -> McpStatus {
         match &*self.inner.lock().unwrap() {
             Some(r) => McpStatus {
                 running: true,
