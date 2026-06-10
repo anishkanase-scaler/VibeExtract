@@ -25,11 +25,16 @@ the gate disposes. Pure stdlib regex (the files are flat attribute/style lists).
 import re
 
 # WPS / kdesign dark-theme palette. Body is the sampled native dark-mode grey (== raw km_darkmode_*).
-# Accents are overridable per call (always prefer values SAMPLED from the native crop).
-DARK_BODY = "#c7c7c7"
+# COLOUR SOURCE OF TRUTH = the icon's DESIGNED accent (its named accent CLASS), NOT the screenshot.
+# These are the ACTIVE/focused-window dark-theme values — bright body grey + VIVID accents that pop on a
+# dark bar. Do NOT match a screenshot's colours: a background/inactive window desaturates the whole toolbar
+# (dim grey body + muted accents) and tiny glyphs blend toward grey under anti-aliasing — sampling that
+# ships dull/grey icons. Sample the capture ONLY to REFINE a hue when the glyph is genuinely saturated; a
+# dull/grey sample must NEVER flatten or dull a designed accent. (Use recolor_designed below as the default.)
+DARK_BODY = "#cfcfcf"
 DARK_ACCENTS = {
-    "blue": "#3a82f7", "green": "#21a366", "orange": "#e8730c", "red": "#e0533a",
-    "yellow": "#f5a623", "purple": "#9b59b6", "cyan": "#17a2b8", "teal": "#17a2b8",
+    "blue": "#3d8bf5", "green": "#25b06e", "orange": "#ef7d12", "red": "#ec5347",
+    "yellow": "#f2b324", "purple": "#9a6cf2", "cyan": "#18b3a6", "teal": "#18b3a6",
 }
 
 _COLORWORDS = "blue|green|orange|red|yellow|purple|cyan|teal|gray|grey|black|white"
@@ -89,6 +94,42 @@ def recolor_svg(svg, body_hex=DARK_BODY, accents=None):
         svg,
     )
     return svg
+
+
+def has_accent(svg):
+    """True if the icon is DESIGNED with a named accent (a real colour-word accent class) — i.e. it must
+    render coloured, not grey. False => monochrome line icon (grey)."""
+    if isinstance(svg, (bytes, bytearray)):
+        svg = bytes(svg).decode("utf-8", "ignore")
+    for m in re.finditer(r"kd-color-icon-(%s)\b" % _COLORWORDS, svg.lower()):
+        if m.group(1) not in _NEUTRAL:
+            return True
+    return bool(re.search(r"color(%s)(stroke|fill)" % _COLORWORDS, svg.lower()))
+
+
+def recolor_designed(svg, body_hex=DARK_BODY, refine=None):
+    """THE DEFAULT recolour — capture-INDEPENDENT, correct on the first pass.
+
+    BODY -> `body_hex` (active-window bright grey). Each named ACCENT class -> its DESIGNED vivid
+    dark-theme accent (DARK_ACCENTS, the active/focused look). An icon with a named accent class is ALWAYS
+    coloured & vivid; an icon with none stays monochrome grey. The screenshot is NOT consulted here.
+
+    `refine`: optional {word: (r,g,b)} of accent colours SAMPLED from the native glyph — used ONLY to nudge
+    the HUE, and ONLY when the sample is genuinely saturated/bright. A dull/grey/desaturated sample is
+    ignored, so a background/inactive-window capture can never flatten or dull a designed accent.
+    """
+    import colorsys
+    accents = dict(DARK_ACCENTS)
+    if refine:
+        for word, rgb in refine.items():
+            if not rgb:
+                continue
+            h, s, v = colorsys.rgb_to_hsv(*[c / 255 for c in rgb])
+            if s < 0.30 or v < 0.30:          # dull/grey sample -> ignore, keep the vivid designed accent
+                continue
+            r, g, b = colorsys.hsv_to_rgb(h, max(s, 0.70), max(v, 0.86))   # keep sampled hue, force vivid
+            accents[word] = "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+    return recolor_svg(svg, body_hex=body_hex, accents=accents)
 
 
 def classify_classes(svg):

@@ -59,7 +59,11 @@ the master memory `[[replicate-ui-method]]`.)
    install dir (`ps -p <pid> -o comm=` / `mdfind` / `/Applications/<App>.app`) and pull its FULL real-icon
    set with `resource_extract.extract_pool(app_path)` (auto-dispatch: Qt `.rcc` / AppKit `Assets.car` /
    Electron inline-SVG / loose). A screenshot crop is a per-icon LAST RESORT, only for a runtime-rendered
-   element with no resource file. → step 3b.
+   element with no resource file. **For config-driven ribbons (WPS/Kingsoft/Office-style) the app ALSO
+   ships the exact command→icon MAP — run `_shared/ribbon_config.py` to read it; never guess icon names
+   (the #1 repeated failure).** This holds for ALL chrome (rails, status bar, title bar), not just
+   ribbons. **Never guess a basename and never reuse a previous component's icon pick without
+   re-verifying every glyph in Chromium against THIS capture** — see the 🔒 ICON LAW below. → step 3b.
 2. **The LLM judges every icon and pixel-matches it to the native reference — then locks it.**
    `icon_match.match(native_crop, pool, idx, name_prior=…, keywords=…)` ranks candidates by a
    colour-invariant silhouette score — the native PIXELS decide, the name map only biases. THEN the
@@ -67,6 +71,31 @@ the master memory `[[replicate-ui-method]]`.)
    once by eye (shape + accent colours) — the score narrows but doesn't settle the final look (thin /
    accent-only glyphs stay low-confidence). Lock every confirmed pick in `icon_map.json`
    (`{resource,confirmed,crop_hash}`); re-runs FREEZE locked entries → never re-pick → no regression. → step 3b.
+   **Icon COLOUR is the icon's DESIGNED accent (its named accent class) rendered at the ACTIVE-window look
+   (bright body + vivid accent), NOT sampled from the screenshot — a dull/inactive capture must never grey or
+   dull a designed accent.** Use `icon_theme.recolor_designed`. → step 3b.
+
+> ### 🔒 ICON LAW (non-negotiable — dev-flagged, repeat offender; read before touching any icon)
+> 1. **NEVER guess an icon basename.** Every basename MUST come from the app's own config (`.kui`/`.kuip`
+>    via `ribbon_config.py`) OR a confirmed visual match against the real bundle pool. A plausible-looking
+>    name is a guess — banned. This applies to **all** chrome (rails, status bar, title bar, panels), not
+>    just ribbons — they live in the config too (e.g. WPS PDF rails/status are in `pdfcommon.kuip`).
+> 2. **NEVER reuse an icon pick from a previous component / build / tab on faith.** Reuse the METHOD
+>    (layout, generator, fonts) — never the icon→basename mapping without re-verifying it against THIS
+>    capture. "Same chrome as last time" / "unchanged region" is NOT verification. An inherited `NAME_MAP`
+>    returns real-but-WRONG glyphs when its names were guessed (this is exactly how WPS-PDF shipped wrong
+>    rail/status/Extract icons).
+> 3. **EVERY icon is individually verified — none skipped.** Render each candidate in **Chromium
+>    (Playwright), NOT qlmanage** — qlmanage renders themed `_kd` SVGs **blank** (their `<style>` class
+>    fills aren't applied), the blind spot that let wrong chrome icons ship unseen — and compare to a
+>    **fresh native crop of that exact control** (shape + accent). Verify EVERY region (rails, status bar,
+>    title bar, panels), not just the ribbon. Lock confirmed picks in `icon_map.json`.
+> 4. **Screenshot-crop is the ONLY permitted fallback, and ONLY after config + pool are exhausted** and
+>    the exact icon genuinely cannot be produced. Crop the real glyph (never hand-draw). **Guessing a
+>    vector name is NEVER an acceptable substitute for cropping — if unsure, crop, don't guess.**
+> 5. An icon is not "done" until verified by eye against native. "Looks fine," "diminishing returns,"
+>    "SSIM text-capped," "reused from last build" NEVER excuse an unverified icon.
+
 3. **Build the DOM from the AX tree as a real, semantic frontend.** Drive every element from its AX role
    through `markup.el_from_node(node, …)` (single choke point: role→tag via `role-map.json`, stamps
    `data-ax-*`) → semantic tags, REAL focusable controls (`<button>`, `<input>`, `role=tab/slider/combobox`),
@@ -178,6 +207,13 @@ Everything after this section is the detailed loop that implements these four pi
    them in the replica MUST come from a harvest (`extract_assets`) or the reuse cache — this is
    not optional and not something to defer or "fix later." Hand-drawn SVGs are the #1 cause of a
    replica that looks wrong; the user should never have to point one out. So:
+   - 🔒 **OBEY THE ICON LAW (see THE METHOD).** Restated for icons specifically: (a) **never guess a
+     basename** — resolve from config (`ribbon_config.py` / `.kui` / `.kuip` / `pdfcommon.kuip`) or a
+     confirmed visual match; (b) **never reuse a previous component's/build's icon pick on faith** —
+     re-verify EVERY glyph against THIS capture (an inherited `NAME_MAP` ships real-but-wrong glyphs);
+     (c) **verify EVERY icon in Chromium** (not qlmanage — it blanks `_kd` icons) beside its native crop,
+     for EVERY region (rails, status bar, title bar), none skipped; (d) **screenshot-crop only after
+     config+pool are exhausted** — never as a substitute for guessing.
    - **Run `extract_assets { }` on every run** (it reads the LIVE renderer, so it's never stale).
      Per step 2c, reuse only the cached **fonts** (`assets/fonts/*.woff2`) verbatim; re-derive
      **icons/SVGs/images** from this run's harvest, not a prior run's pixels.
@@ -197,7 +233,10 @@ Everything after this section is the detailed loop that implements these four pi
      pick once** (native-vs-top-k grid) and it's **locked in `icon_map.json`** (`{resource,confirmed,
      crop_hash}`); re-runs FREEZE locked entries → never re-pick → **no regression** (the root cause of
      "fixed one, broke another" was global re-picking with no lock). Notes: render candidate masks via
-     BATCHED `qlmanage` (use luma, not alpha — qlmanage paints an opaque white bg); CAP the keyword
+     BATCHED `qlmanage` (use luma, not alpha — qlmanage paints an opaque white bg) — **but ONLY for the
+     silhouette SCORE. The required visual CONFIRMATION render MUST be Chromium (Playwright): `qlmanage`
+     renders themed `_kd` SVGs BLANK (their `<style>` class fills aren't applied), so confirming a `_kd`
+     icon in qlmanage is impossible and is how wrong chrome icons shipped unseen.** CAP the keyword
      shortlist (substring `"line"` → 1000+ candidates). Thin/accent-only glyphs stay low-confidence → the
      model's eye on the top-k. 🚫 **A LOW match score is NEVER a reason to screenshot-crop the glyph.**
      When `icon_match` scores low (thin/small/dark-theme icons routinely do), DON'T fall back to a crop —
@@ -216,6 +255,24 @@ Everything after this section is the detailed loop that implements these four pi
          `_shared/native_icons.py`+`catalog_extract`: `find_catalogs(app_path)`→`build_pool(car,out)`→
          `load_pool(out,"normal_dark"|"normal")`. `name_match(ax_name,pool,extra=[catalog name])` supplies
          only the NAME PRIOR — `icon_match` still DECIDES by pixels (pillar 2); this holds for AppKit too.
+       • 🎯 **CONFIG-DRIVEN RIBBONS (WPS/Kingsoft & any app shipping a ribbon definition): RUN THE
+         RESOLVER TOOL FIRST — do NOT guess names.** This is the #1 repeated failure: a session guesses a
+         plausible icon name (or trusts the silhouette score on tiny dark glyphs) and ships the WRONG
+         glyph — even though the app ships the EXACT command→icon map. Prose telling you to "read the
+         .kui" did NOT stop it, so this step is mechanical and MANDATORY. Before picking any ribbon icon:
+         `python3 "<skill-base>/_shared/ribbon_config.py" --app /Applications/<App>.app --module et|wps|wpp|pdf
+         --labels "Btn One;Btn Two;…"` → it parses the app's WHOLE `.kui`/`.kuip` config and returns each
+         button's exact `icon=` basename (+ alternates). KEY: the top-level `*ongmani.kui` is mostly
+         titlebar/file-menu — the ribbon bindings live in its `<import>`s (`etcommon.kuip`,
+         `commands/<module>/ongmani/CT_<Tab>.kuip`, …) which the tool scans; the binding is keyed by
+         `id=`/`ksoCmd=`/`text=`, NOT `name=`. `--module` disambiguates labels shared across modules
+         (et=Sheets, wps=Writer, wpp=Presentation, pdf=PDF). For a button whose UI label ≠ command text
+         (e.g. Sheets **"Highlight Row & Column" is the *Reading Layout* command → `reading_mode_kd`**),
+         run `--grep <keyword>` / read the full dump (no `--labels`) and match by meaning. 🚫 NEVER
+         hand-pick a name and 🚫 NEVER claim "verified from the .kui" unless this tool produced it. THEN
+         pull each basename from the pool (below), recolour by class (keep accents), and STILL confirm
+         every placed glyph against a fresh native crop (the gate, step 8b) — the map is exact, but you
+         confirm colour + placement. (`--pid <pid>` locates the app from a running process.)
        • **Qt / Kingsoft / cross-platform (WPS & many others): Qt resource bundles `*.rcc`/`*.qrc`**
          (e.g. WPS `…/Contents/Resources/office6/mui/default/prometheus_kso_res.rcc`,
          `…/skins/<active-theme>/default/*.rcc`). Parse the `qres` format directly: header magic
@@ -233,11 +290,20 @@ Everything after this section is the detailed loop that implements these four pi
      per icon** — that paints the BODY in the accent colour (a fully-blue document instead of grey-doc +
      blue badge). It's invisible on monochrome icons and only bites accented ones, so it hides until you
      eyeball them (this was a real regression on PDF→Word/Excel/PPT/Picture-to-PDF). Use the canonical
-     **`_shared/icon_theme.recolor_svg(svg, body_hex, accents=…)`**: BODY classes → the native dark-mode
-     grey (SAMPLE it, ≈`#c7c7c7`), each NAMED-accent class → its native-SAMPLED accent (dark-theme accents
-     are SOFTER than the kd light defaults — e.g. blue `#558fec` not `#3a82f7`; sample, don't assume).
-     Colours MUST be baked (an `<img src>` SVG can't inherit; qlmanage/Chromium ignore CSS vars). Run the
-     recolour at BUILD time so no icon can ship mis-coloured. Place each icon at its **measured glyph box** (step 6).
+     **Colour = the icon's DESIGNED accent, NOT the screenshot — `_shared/icon_theme.recolor_designed(svg,
+     body_hex)` (the capture-INDEPENDENT default; correct on the FIRST pass).** BODY classes → the
+     ACTIVE-window icon grey (BRIGHT ≈`#cfcfcf`); each NAMED-accent class → its DESIGNED VIVID dark accent
+     (`DARK_ACCENTS`: green `#25b06e`, blue `#3d8bf5`, orange `#ef7d12`, red `#ec5347`, …). **An icon with a
+     named accent class is ALWAYS coloured + vivid; no accent class ⇒ monochrome grey.** 🚫 **Do NOT take an
+     icon's colour by SAMPLING the screenshot** — a background/inactive/unfocused window desaturates the
+     WHOLE toolbar (dim grey body + muted accents) and tiny glyphs blend toward grey under AA, so sampling
+     ships DULL or GREY icons (this exact bug cost two dev round-trips on WPS-Sheets Formulas: logical/text/
+     mathtrig/lookup are designed `green` but the inactive capture greyed them). The screenshot only REFINES
+     a hue — `recolor_designed(refine={word:(r,g,b)})` nudges the accent hue ONLY when that glyph is
+     genuinely saturated; a dull/grey/desaturated sample is IGNORED and can NEVER flatten or dull a designed
+     accent. Disabled/dimmed tools ⇒ dim the WHOLE button (opacity), never grey the accent. Colours MUST be
+     baked (an `<img src>` SVG can't inherit; qlmanage/Chromium ignore CSS vars); recolour at BUILD time.
+     Place each icon at its **measured glyph box** (step 6).
    - 🚦 **MANDATORY colour-aware icon gate — don't stop until it passes.** The silhouette-mask scorer is
      COLOUR-BLIND and whole-strip SSIM is alignment-dominated — BOTH miss a wrong body colour or wrong
      accent. After placing icons, run **`_shared/icon_match.gate_icon(native_crop, replica_crop)`** per
@@ -448,6 +514,11 @@ Everything after this section is the detailed loop that implements these four pi
    contact sheet.** A `FAIL` is never "done"; an unreviewed `EYEBALL` is never "done". (The gate is
    deliberately conservative on tiny AA'd glyphs — colour metrics are noisy, so it hard-fails only gross
    errors and routes the rest to your eye; the recolour step in 3b is what makes the FIRST render correct.)
+   - 🔒 **The gate covers EVERY icon in EVERY region — rails, status bar, title bar, panels — NOT just
+     the ribbon. No icon may be excluded from `icon_boxes.json` or skipped.** The contact sheet that you
+     eyeball is a **Chromium** render of the replica (qlmanage blanks `_kd` icons, so a qlmanage-only check
+     is worthless for themed glyphs — per the ICON LAW). An icon that was reused/inherited from a prior
+     build is NOT exempt: it must pass this gate against THIS capture like any freshly-picked icon.
 
 9. **Iterate — YOURSELF, to the bar. The dev picks once and never iterates.** If `pass` is false
    (score < 0.92): inspect the heatmap, fix the HTML/CSS for the highlighted regions, re-render,

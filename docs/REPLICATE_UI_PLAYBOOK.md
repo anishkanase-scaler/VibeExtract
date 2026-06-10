@@ -88,6 +88,9 @@ The agent loop is defined in the **`replicate-ui`** skill
 > attempt**: the dev should never have to point out that an icon or colour is wrong. (Likewise,
 > `sample_color` backgrounds at several points — a title bar / header / body can be different
 > shades; don't assume one flat fill.)
+> **Icons specifically obey the 🔒 ICON LAW (see "Config-driven ribbons" below): never guess a basename,
+> never reuse a prior component's pick on faith, verify EVERY icon in Chromium vs its native crop
+> (qlmanage blanks `_kd` glyphs), screenshot only when config+pool are exhausted.**
 
 For a true pixel match you need the app's **actual** assets, not hand-drawn
 approximations. `extract_assets` drives CDP (`Runtime.evaluate` + `Page.captureScreenshot`)
@@ -112,6 +115,55 @@ app and restart the MCP server after changing either.
 
 `@playwright/mcp` provides `browser_navigate`, `browser_resize`,
 `browser_take_screenshot`, etc.
+
+## Config-driven ribbons (WPS / Kingsoft / Office-style) — the #1 icon-failure fix
+
+For native ribbon apps that ship an XML ribbon definition (WPS Office: PDF/Sheets/Writer/Presentation),
+the recurring failure is **guessing icon names** (or trusting the silhouette score on tiny dark glyphs)
+and shipping the wrong glyph — even though the app ships the **exact command→icon map**. Prose telling
+the agent to "read the `.kui`" did not stop it, so use the **mechanical resolver**:
+
+```bash
+python3 "<skill-base>/_shared/ribbon_config.py" --app /Applications/wpsoffice.app \
+        --module et|wps|wpp|pdf --labels "Full Screen;Zoom;Arrange All;New Window;Split"
+# no --labels => dump the whole command→icon table;  --grep <kw> => search it;  --pid <pid> => locate app
+```
+
+It scans the app's WHOLE config (the top-level `*ongmani.kui` is just titlebar/file-menu — the ribbon
+bindings live in its `<import>`s: `etcommon.kuip`, `commands/<module>/ongmani/CT_<Tab>.kuip`, …), keyed by
+`id=`/`ksoCmd=`/`text=` (NOT `name=`), and returns each button's exact `icon=` basename + alternates.
+`--module` disambiguates labels shared across modules (et=Sheets, wps=Writer, wpp=Presentation, pdf=PDF).
+A few buttons have a UI label ≠ command text (e.g. WPS-Sheets **"Highlight Row & Column" = the *Reading
+Layout* command → `reading_mode_kd`**) — use `--grep`/the full dump and match by meaning. Then pull each
+basename from the `.rcc` pool, recolour by class (keep accents), and **still confirm every placed glyph
+against a fresh native crop** (the map is exact; you confirm colour + placement).
+
+🚫 NEVER hand-pick a name; 🚫 NEVER claim "verified from the .kui" unless the tool produced it.
+
+> ### 🔒 ICON LAW (non-negotiable — dev-flagged, repeat offender)
+> This governs **all chrome** (rails, status bar, title bar, panels), not just ribbons — they're in the
+> config too (WPS PDF rails/status are in `pdfcommon.kuip`).
+> 1. **NEVER guess an icon basename.** It must come from the app config (`ribbon_config.py` / `.kui` /
+>    `.kuip`) or a confirmed visual match against the real pool. A plausible name is a guess — banned.
+> 2. **NEVER reuse a previous component's / build's / tab's icon pick on faith.** Reuse the METHOD
+>    (layout, generator, fonts); re-verify every icon→basename against THIS capture. "Same chrome / unchanged
+>    region" is not verification — an inherited `NAME_MAP` ships **real-but-WRONG** glyphs (WPS-PDF rails,
+>    status bar, and Extract all shipped wrong this way).
+> 3. **Verify EVERY icon individually, in Chromium, none skipped.** `qlmanage` renders themed `_kd` SVGs
+>    **blank** (class fills not applied) — that blind spot is how wrong chrome icons shipped unseen. Render
+>    each candidate in Chromium (Playwright) beside a **fresh native crop of that exact control** and confirm
+>    shape + accent, for every region. Lock confirmed picks in `icon_map.json`.
+> 4. **Screenshot-crop is the ONLY fallback, and ONLY after config + pool are exhausted** and the exact
+>    icon truly can't be produced (crop the real glyph; never hand-draw). **Guessing a vector name is NEVER
+>    a substitute for cropping — if unsure, crop, don't guess.**
+> 5. Not "done" until verified by eye vs native. "Looks fine" / "diminishing returns" / "SSIM text-capped"
+>    / "reused from last build" never excuse an unverified icon.
+
+**Chrome ≠ document:** a window's vertical scrollbar / right tool-rail / status dock is **chrome** — pin
+it as its own element at the window edge; do NOT bake it into the document-content crop, or it floats as a
+stray vertical icon-bar over the sheet (a flagged glitch). Crop the document up to the rail; place the rail
+(or its reconstruction) absolutely at `right:0`. Inline-size content `<img width=.. height=..>` so the
+in-app Preview can't stretch it.
 
 ## Semantic, interactive markup (role → HTML element)
 
@@ -405,12 +457,22 @@ document **body** gets painted the accent colour (a fully-blue PDF→Word doc in
 "W"). It's invisible on monochrome icons and only bites accented ones, so it survives until you eyeball
 them. Fixes, now baked into the toolkit:
 
-- **`_shared/icon_theme.py` `recolor_svg(svg, body_hex, accents=…)`** — THE canonical recolour. Assigns
-  colour by CLASS ROLE: body classes → the native dark-mode grey (SAMPLE it, ≈`#c7c7c7`); each named-
-  accent class → its native-SAMPLED accent. Dark-theme accents are SOFTER than the kd light defaults
-  (blue `#558fec` not `#3a82f7`, green `#30ab80`, orange `#e08042`, red `#e75560`) — sample from the
-  native crop, don't trust the kd `#hex`. Handles both the raw `var(--…,fallback)` and hardcoded forms.
-  Call it at BUILD time (the WPS `build_tools.py` recolours every `icons/*.svg` on each run).
+- **`_shared/icon_theme.py` `recolor_designed(svg, body_hex, refine=…)`** — THE canonical recolour, and the
+  DEFAULT every build should call. Assigns colour by CLASS ROLE, and the COLOUR SOURCE OF TRUTH is the
+  icon's **DESIGNED accent (its named accent CLASS), NOT the screenshot** — so it is correct on the FIRST
+  pass with zero dev feedback. Body classes → the **ACTIVE-window** bright grey (`#cfcfcf`); each named-
+  accent class → its **DESIGNED VIVID** dark-theme accent (blue `#3d8bf5`, green `#25b06e`, orange `#ef7d12`,
+  red `#ec5347`, purple `#9a6cf2`, teal `#18b3a6`, yellow `#f2b324`). **An icon with a named accent class is
+  ALWAYS coloured + vivid; no accent class ⇒ monochrome grey.** 🚫 Do NOT take an icon's colour by SAMPLING
+  the screenshot: a background/inactive/unfocused window desaturates the WHOLE toolbar (dim body + muted
+  accents) and tiny glyphs blend toward grey under AA, so sampling ships dull/grey icons (this is exactly why
+  WPS-Sheets Formulas icons shipped grey twice). The capture only REFINES a hue — pass
+  `refine={word:(r,g,b)}` from `icon_match.dominant_accent`, and `recolor_designed` IGNORES a dull/grey/
+  desaturated sample (`s<0.30` or `v<0.30`), so an inactive-window capture can never flatten or dull a
+  designed accent. Disabled tools ⇒ dim the WHOLE button (icon+label opacity), never grey the accent. Render
+  the ACTIVE/focused appearance, never the dull inactive-window capture. (`recolor_svg(svg, body_hex,
+  accents=…)` remains as the lower-level override `recolor_designed` builds on.) Handles both the raw
+  `var(--…,fallback)` and hardcoded `#hex` forms. Call it at BUILD time (recolours every `ic/*.svg` per run).
 - **`_shared/icon_match.py` `gate_icon(native_crop, replica_crop)`** — the COLOUR-AWARE gate the
   silhouette-mask scorer (colour-blind) and whole-strip SSIM (alignment-dominated) both miss. Scores
   shape AND samples body+accent on both sides (≤~24/ch, median-of-core so AA doesn't fool it). Locate
@@ -428,7 +490,8 @@ them. Fixes, now baked into the toolkit:
   PASS) / **1** (gross colour FAIL — fix + rebuild) / **2** (some EYEBALL — low-confidence localize /
   thin glyph). It's deliberately conservative — colour metrics on tiny AA'd glyphs are noisy, so it
   hard-fails only GROSS errors (body painted the accent ≈ Δ140) and routes the rest to your eye;
-  `recolor_svg` is what makes the FIRST render correct. **DoD: icons are done only at exit 0, or exit 2
+  `recolor_designed` (designed accent primary, capture-independent) is what makes the FIRST render correct —
+  the gate confirms, it is NOT the colour source. **DoD: icons are done only at exit 0, or exit 2
   with every EYEBALL tile confirmed identical by eye on the contact sheet. A FAIL or an unreviewed
   EYEBALL is never "done."** (SKILL.md steps 8b + 11.)
 

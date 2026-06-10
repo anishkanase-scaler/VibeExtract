@@ -59,7 +59,9 @@ the master memory `[[replicate-ui-method]]`.)
    install dir (`ps -p <pid> -o comm=` / `mdfind` / `/Applications/<App>.app`) and pull its FULL real-icon
    set with `resource_extract.extract_pool(app_path)` (auto-dispatch: Qt `.rcc` / AppKit `Assets.car` /
    Electron inline-SVG / loose). A screenshot crop is a per-icon LAST RESORT, only for a runtime-rendered
-   element with no resource file. → step 3b.
+   element with no resource file. **For config-driven ribbons (WPS/Kingsoft/Office-style) the app ALSO
+   ships the exact command→icon MAP — run `_shared/ribbon_config.py` to read it; never guess icon names
+   (the #1 repeated failure).** → step 3b.
 2. **The LLM judges every icon and pixel-matches it to the native reference — then locks it.**
    `icon_match.match(native_crop, pool, idx, name_prior=…, keywords=…)` ranks candidates by a
    colour-invariant silhouette score — the native PIXELS decide, the name map only biases. THEN the
@@ -67,6 +69,9 @@ the master memory `[[replicate-ui-method]]`.)
    once by eye (shape + accent colours) — the score narrows but doesn't settle the final look (thin /
    accent-only glyphs stay low-confidence). Lock every confirmed pick in `icon_map.json`
    (`{resource,confirmed,crop_hash}`); re-runs FREEZE locked entries → never re-pick → no regression. → step 3b.
+   **Icon COLOUR is the icon's DESIGNED accent (its named accent class) rendered at the ACTIVE-window look
+   (bright body + vivid accent), NOT sampled from the screenshot — a dull/inactive capture must never grey or
+   dull a designed accent.** Use `icon_theme.recolor_designed`. → step 3b.
 3. **Build the DOM from the AX tree as a real, semantic frontend.** Drive every element from its AX role
    through `markup.el_from_node(node, …)` (single choke point: role→tag via `role-map.json`, stamps
    `data-ax-*`) → semantic tags, REAL focusable controls (`<button>`, `<input>`, `role=tab/slider/combobox`),
@@ -216,6 +221,24 @@ Everything after this section is the detailed loop that implements these four pi
          `_shared/native_icons.py`+`catalog_extract`: `find_catalogs(app_path)`→`build_pool(car,out)`→
          `load_pool(out,"normal_dark"|"normal")`. `name_match(ax_name,pool,extra=[catalog name])` supplies
          only the NAME PRIOR — `icon_match` still DECIDES by pixels (pillar 2); this holds for AppKit too.
+       • 🎯 **CONFIG-DRIVEN RIBBONS (WPS/Kingsoft & any app shipping a ribbon definition): RUN THE
+         RESOLVER TOOL FIRST — do NOT guess names.** This is the #1 repeated failure: a session guesses a
+         plausible icon name (or trusts the silhouette score on tiny dark glyphs) and ships the WRONG
+         glyph — even though the app ships the EXACT command→icon map. Prose telling you to "read the
+         .kui" did NOT stop it, so this step is mechanical and MANDATORY. Before picking any ribbon icon:
+         `python3 "<skill-base>/_shared/ribbon_config.py" --app /Applications/<App>.app --module et|wps|wpp|pdf
+         --labels "Btn One;Btn Two;…"` → it parses the app's WHOLE `.kui`/`.kuip` config and returns each
+         button's exact `icon=` basename (+ alternates). KEY: the top-level `*ongmani.kui` is mostly
+         titlebar/file-menu — the ribbon bindings live in its `<import>`s (`etcommon.kuip`,
+         `commands/<module>/ongmani/CT_<Tab>.kuip`, …) which the tool scans; the binding is keyed by
+         `id=`/`ksoCmd=`/`text=`, NOT `name=`. `--module` disambiguates labels shared across modules
+         (et=Sheets, wps=Writer, wpp=Presentation, pdf=PDF). For a button whose UI label ≠ command text
+         (e.g. Sheets **"Highlight Row & Column" is the *Reading Layout* command → `reading_mode_kd`**),
+         run `--grep <keyword>` / read the full dump (no `--labels`) and match by meaning. 🚫 NEVER
+         hand-pick a name and 🚫 NEVER claim "verified from the .kui" unless this tool produced it. THEN
+         pull each basename from the pool (below), recolour by class (keep accents), and STILL confirm
+         every placed glyph against a fresh native crop (the gate, step 8b) — the map is exact, but you
+         confirm colour + placement. (`--pid <pid>` locates the app from a running process.)
        • **Qt / Kingsoft / cross-platform (WPS & many others): Qt resource bundles `*.rcc`/`*.qrc`**
          (e.g. WPS `…/Contents/Resources/office6/mui/default/prometheus_kso_res.rcc`,
          `…/skins/<active-theme>/default/*.rcc`). Parse the `qres` format directly: header magic
@@ -233,11 +256,20 @@ Everything after this section is the detailed loop that implements these four pi
      per icon** — that paints the BODY in the accent colour (a fully-blue document instead of grey-doc +
      blue badge). It's invisible on monochrome icons and only bites accented ones, so it hides until you
      eyeball them (this was a real regression on PDF→Word/Excel/PPT/Picture-to-PDF). Use the canonical
-     **`_shared/icon_theme.recolor_svg(svg, body_hex, accents=…)`**: BODY classes → the native dark-mode
-     grey (SAMPLE it, ≈`#c7c7c7`), each NAMED-accent class → its native-SAMPLED accent (dark-theme accents
-     are SOFTER than the kd light defaults — e.g. blue `#558fec` not `#3a82f7`; sample, don't assume).
-     Colours MUST be baked (an `<img src>` SVG can't inherit; qlmanage/Chromium ignore CSS vars). Run the
-     recolour at BUILD time so no icon can ship mis-coloured. Place each icon at its **measured glyph box** (step 6).
+     **Colour = the icon's DESIGNED accent, NOT the screenshot — `_shared/icon_theme.recolor_designed(svg,
+     body_hex)` (the capture-INDEPENDENT default; correct on the FIRST pass).** BODY classes → the
+     ACTIVE-window icon grey (BRIGHT ≈`#cfcfcf`); each NAMED-accent class → its DESIGNED VIVID dark accent
+     (`DARK_ACCENTS`: green `#25b06e`, blue `#3d8bf5`, orange `#ef7d12`, red `#ec5347`, …). **An icon with a
+     named accent class is ALWAYS coloured + vivid; no accent class ⇒ monochrome grey.** 🚫 **Do NOT take an
+     icon's colour by SAMPLING the screenshot** — a background/inactive/unfocused window desaturates the
+     WHOLE toolbar (dim grey body + muted accents) and tiny glyphs blend toward grey under AA, so sampling
+     ships DULL or GREY icons (this exact bug cost two dev round-trips on WPS-Sheets Formulas: logical/text/
+     mathtrig/lookup are designed `green` but the inactive capture greyed them). The screenshot only REFINES
+     a hue — `recolor_designed(refine={word:(r,g,b)})` nudges the accent hue ONLY when that glyph is
+     genuinely saturated; a dull/grey/desaturated sample is IGNORED and can NEVER flatten or dull a designed
+     accent. Disabled/dimmed tools ⇒ dim the WHOLE button (opacity), never grey the accent. Colours MUST be
+     baked (an `<img src>` SVG can't inherit; qlmanage/Chromium ignore CSS vars); recolour at BUILD time.
+     Place each icon at its **measured glyph box** (step 6).
    - 🚦 **MANDATORY colour-aware icon gate — don't stop until it passes.** The silhouette-mask scorer is
      COLOUR-BLIND and whole-strip SSIM is alignment-dominated — BOTH miss a wrong body colour or wrong
      accent. After placing icons, run **`_shared/icon_match.gate_icon(native_crop, replica_crop)`** per
