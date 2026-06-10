@@ -65,19 +65,101 @@ def _ink_from_rgba(im):
 
 
 def _inline_css_vars(svg_bytes):
-    """qlmanage can't resolve CSS custom properties, so theme-templated SVGs (kdesign '_kd':
-    fill:var(--kd-color-icon-primary,#333333) / currentColor) render BLANK on its white bg — an
-    empty silhouette → a useless mask whose score collapses to ~0.2-0.3 regardless of correctness.
-    Inline each var()'s fallback colour and give currentColor a visible value so the glyph actually
-    paints. Best-effort; on any error the caller keeps the original bytes."""
+    """Make theme-templated SVGs actually PAINT under qlmanage so the matcher can SCORE them.
+
+    qlmanage's renderer (a) IGNORES `<style>`-block CLASS selectors and (b) SKIPS elements gated by
+    `requiredCustomFeatures`. kdesign '_kd' icons colour their geometry via classes
+    (`.kd-color-icon-primary{fill:#c7c7c7}`), and/or via `var()`/`currentColor`, and carry
+    `requiredCustomFeatures="data-kd-color-scheme"` — so they render BLANK on qlmanage's white bg →
+    a useless ~0.2-0.3 silhouette regardless of correctness. THIS is the root cause that pushed
+    sessions to guess `_kd` basenames instead of trusting the visual score (see the ICON LAW in
+    SKILL.md). Fix, generic to ANY themed-SVG app: (0) drop requiredCustomFeatures, (1) resolve every
+    `<style>` class's fill/stroke onto the matching `class="..."` elements as INLINE attributes,
+    (2) inline leftover var()/currentColor. Best-effort; on any error the caller keeps the original."""
     try:
         s = svg_bytes.decode("utf-8", "ignore")
+        # (0) qlmanage/WebKit skips elements with an unsatisfied required(Custom)Features -> drop it
+        s = re.sub(r'\s+required(?:Custom)?Features="[^"]*"', "", s)
+        # (1) collect {class -> {fill/stroke: concrete colour}} from every <style> block ...
+        cls = {}
+        for block in re.findall(r"<style[^>]*>(.*?)</style>", s, re.S):
+            for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", block):
+                props = {}
+                for pm in re.finditer(r"\b(fill|stroke)\s*:\s*([^;}]+)", body):
+                    v = pm.group(2).strip()
+                    vm = re.match(r"var\(\s*--[^,)]+,\s*([^)]+)\)", v)
+                    v = vm.group(1).strip() if vm else ("#333333" if v.startswith("var(") else v)
+                    if v.lower() != "none":
+                        props[pm.group(1)] = v
+                for nm in re.findall(r"\.([A-Za-z0-9_-]+)", sel):
+                    if props:
+                        cls.setdefault(nm, {}).update(props)
+        # ... and inline them onto each painted element that carries those classes
+        def _inject(tag):
+            t = tag.group(0)
+            cm = re.search(r'class="([^"]*)"', t)
+            if not cm:
+                return t
+            want = {}
+            for nm in cm.group(1).split():
+                want.update(cls.get(nm, {}))
+            ins = "".join(f' {p}="{v}"' for p, v in want.items() if not re.search(rf'\b{p}=', t))
+            if not ins:
+                return t
+            return (t[:-2] + ins + "/>") if t.endswith("/>") else (t[:-1] + ins + ">")
+        if cls:
+            s = re.sub(r"<(?:path|rect|circle|ellipse|polygon|polyline|line|g)\b[^>]*>", _inject, s)
+        # (2) any leftover inline var()/currentColor
         s = re.sub(r"var\(\s*--[^,)]+,\s*([^)]+)\)", r"\1", s)   # var(--x, #fff) -> #fff
         s = re.sub(r"var\(\s*--[^)]+\)", "#333333", s)           # var(--x) (no fallback) -> dark
         s = s.replace("currentColor", "#333333")
         return s.encode("utf-8")
     except Exception:
         return svg_bytes
+
+
+def _find_chromium():
+    """Locate a headless-capable Chromium (the playwright-bundled one) — the ONLY engine in this
+    environment that rasterises kdesign `_kd` SVGs (qlmanage renders them blank). Returns a path or
+    None; on None the caller silently keeps the qlmanage result (graceful, no regression)."""
+    pats = [os.path.expanduser("~/Library/Caches/ms-playwright/chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium"),
+            os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome")]
+    found = []
+    for p in pats:
+        found += glob.glob(p)
+    return sorted(found)[-1] if found else None
+
+
+def _chromium_render(svg_paths, size, chromium):
+    """Batch-rasterise svgs to size×size TRANSPARENT-bg PNGs via ONE headless-chromium screenshot of
+    a grid (one browser launch for the whole batch). Returns {svg_path: RGBA image}. Best-effort:
+    any failure -> {} so the caller falls back to the qlmanage masks."""
+    try:
+        n = len(svg_paths)
+        cols = min(n, 16) or 1
+        rows = (n + cols - 1) // cols
+        with tempfile.TemporaryDirectory() as td:
+            items = "".join(
+                f'<img src="file://{p}" style="position:absolute;left:{(i % cols) * size}px;'
+                f'top:{(i // cols) * size}px;width:{size}px;height:{size}px">'
+                for i, p in enumerate(svg_paths))
+            hp = os.path.join(td, "grid.html")
+            open(hp, "w").write(f'<!doctype html><meta charset=utf-8><body style="margin:0">{items}</body>')
+            outp = os.path.join(td, "shot.png")
+            subprocess.run([chromium, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+                            "--force-device-scale-factor=1", "--default-background-color=00000000",
+                            f"--screenshot={outp}", f"--window-size={cols * size},{rows * size}",
+                            f"file://{hp}"], capture_output=True, timeout=90)
+            if not os.path.exists(outp):
+                return {}
+            sheet = Image.open(outp).convert("RGBA")
+            res = {}
+            for i, p in enumerate(svg_paths):
+                x, y = (i % cols) * size, (i // cols) * size
+                res[p] = sheet.crop((x, y, x + size, y + size))
+            return res
+    except Exception:
+        return {}
 
 
 def normalize(binary, size=64, blur=1.2):
@@ -142,6 +224,22 @@ def render_masks(pool, keys, size=64, cache_dir="cache/masks", blur=1.2, batch=1
                 continue
             m = normalize(_ink_from_rgba(Image.open(pngs[0]).convert("RGBA")), size, blur)
             m.save(cp); out[k] = m
+        # Remediation: kdesign `_kd` icons rasterise BLANK under qlmanage (its SVG engine can't draw
+        # them) -> a useless mask that drove sessions to GUESS basenames (the ICON LAW root cause).
+        # Re-render those blanks via headless Chromium (the only engine here that paints them) so the
+        # silhouette score is REAL. Best-effort: no Chromium / failure -> keep the qlmanage mask.
+        blank = [(k, cp, sp) for (k, h, cp, sp) in svg_jobs
+                 if k in out and ImageStat.Stat(out[k]).mean[0] < 2.0]
+        chromium = _find_chromium() if blank else None
+        if chromium:
+            shots = _chromium_render([sp for _, _, sp in blank], size, chromium)
+            for k, cp, sp in blank:
+                im = shots.get(sp)
+                if im is None:
+                    continue
+                m = normalize(_ink_from_rgba(im), size, blur)
+                if ImageStat.Stat(m).mean[0] >= 2.0:        # accept only a genuinely non-blank result
+                    m.save(cp); out[k] = m
     return out
 
 

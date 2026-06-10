@@ -258,6 +258,79 @@ fn bundled_skill(app: &AppHandle, name: &str) -> Option<PathBuf> {
     cands.into_iter().find(|p| p.join("SKILL.md").exists())
 }
 
+/// Locate the bundled plugin *marketplace* dir (holds `.claude-plugin/marketplace.json`):
+/// the .app's Resources first (shipped build), then this repo's resources (dev build).
+fn bundled_plugin(app: &AppHandle) -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = app.path().resource_dir() {
+        cands.push(rd.join("resources").join("plugin"));
+        cands.push(rd.join("plugin"));
+    }
+    cands.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join("plugin"));
+    cands
+        .into_iter()
+        .find(|p| p.join(".claude-plugin").join("marketplace.json").exists())
+}
+
+/// Run a command through a login shell, returning (success, combined stdout+stderr).
+fn login_shell_status(cmd: &str) -> (bool, String) {
+    match std::process::Command::new("/bin/zsh").args(["-lc", cmd]).output() {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.success(), s)
+        }
+        Err(e) => (false, e.to_string()),
+    }
+}
+
+/// True if the `claude` CLI is on the (login-shell) PATH.
+fn has_claude_cli() -> bool {
+    !login_shell("command -v claude").is_empty()
+}
+
+/// Install the bundled plugin via the `claude` CLI (writes Claude's own config correctly —
+/// no fabricating ~/.claude internals). Copies the bundled marketplace to a stable WRITABLE
+/// location, bakes the live MCP url into the plugin manifest, then `marketplace add` + `install`
+/// (both idempotent, falling back to `update`). Returns Ok(true) if the plugin ends up installed.
+fn install_plugin_via_cli(app: &AppHandle, vibe_url: &str, notes: &mut Vec<String>) -> Result<bool, String> {
+    let src = bundled_plugin(app).ok_or("bundled plugin marketplace not found")?;
+    // Stable writable copy (the .app Resources is read-only; the marketplace source path must persist).
+    let dest = dirs_home().join(".vibe-extract").join("plugin");
+    let _ = std::fs::remove_dir_all(&dest);
+    copy_tree(&src, &dest).map_err(|e| format!("copy plugin failed: {e}"))?;
+
+    // Bake the live vibe-extract url into the installed plugin manifest (the MCP port can vary).
+    let manifest = dest.join("replicate-ui").join(".claude-plugin").join("plugin.json");
+    if let Ok(txt) = std::fs::read_to_string(&manifest) {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(srv) = v.pointer_mut("/mcpServers/vibe-extract/url") {
+                *srv = serde_json::Value::String(vibe_url.to_string());
+            }
+            if let Ok(body) = serde_json::to_string_pretty(&v) {
+                let _ = std::fs::write(&manifest, body);
+            }
+        }
+    }
+
+    let dest_s = dest.display().to_string();
+    // Idempotent: add (or refresh) the marketplace, then install (or update) the plugin.
+    let cmd = format!(
+        "claude plugin marketplace add '{p}' --scope user 2>&1 || claude plugin marketplace update vibe-extract 2>&1; \
+         claude plugin install replicate-ui@vibe-extract --scope user 2>&1 || claude plugin update replicate-ui@vibe-extract 2>&1; \
+         claude plugin list 2>&1",
+        p = dest_s.replace('\'', "'\\''")
+    );
+    let (_ok, out) = login_shell_status(&cmd);
+    let installed = out.contains("replicate-ui@vibe-extract");
+    if installed {
+        notes.push("installed /replicate-ui plugin (vibe-extract MCP bundled, on by default)".into());
+    } else {
+        notes.push(format!("plugin install did not confirm; CLI said: {}", out.trim().chars().take(200).collect::<String>()));
+    }
+    Ok(installed)
+}
+
 fn has_pillow() -> bool {
     String::from_utf8_lossy(&login_shell("python3 -c 'import PIL' 2>/dev/null && echo OK")).contains("OK")
 }
@@ -317,47 +390,78 @@ fn register_mcp_servers(vibe_url: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Install the bundled skill(s) + register MCP + best-effort deps. Idempotent.
+/// Install the bundled PLUGIN (skills + vibe-extract MCP) + best-effort deps. Idempotent.
+/// Primary path: `claude plugin marketplace add` + `install` so one app install gives the user
+/// `/replicate-ui` and the vibe-extract MCP with no manual setup. Fallback (no `claude` CLI):
+/// the legacy loose-skill copy into ~/.claude/skills + MCP merge into ~/.claude.json.
 fn setup_claude_integration(app: &AppHandle, mcp_url: Option<String>) -> Result<SetupReport, String> {
     let mut notes: Vec<String> = Vec::new();
-    let skills_dir = dirs_home().join(".claude").join("skills");
-    std::fs::create_dir_all(&skills_dir).map_err(|e| e.to_string())?;
+    let vibe_url = mcp_url.unwrap_or_else(|| "http://127.0.0.1:8765/mcp".to_string());
 
-    // 1) copy the skill(s) into ~/.claude/skills (overwrite so app updates refresh them)
     let mut skill_installed = false;
     let mut skill_path = String::new();
-    for name in ["replicate-ui", "replicate-ui-watch"] {
-        if let Some(src) = bundled_skill(app, name) {
-            let dst = skills_dir.join(name);
-            let _ = std::fs::remove_dir_all(&dst);
-            match copy_tree(&src, &dst) {
-                Ok(_) => {
-                    if name == "replicate-ui" {
-                        skill_installed = true;
-                        skill_path = dst.display().to_string();
-                    }
-                }
-                Err(e) => notes.push(format!("copy {name} failed: {e}")),
-            }
-        } else if name == "replicate-ui" {
-            notes.push("bundled replicate-ui skill not found".into());
-        }
-    }
+    let mut mcp_registered = false;
 
-    // 2) register MCP servers (vibe-extract at the live url + playwright)
-    let vibe_url = mcp_url.unwrap_or_else(|| "http://127.0.0.1:8765/mcp".to_string());
-    let mcp_registered = match register_mcp_servers(&vibe_url) {
-        Ok(changed) => {
-            if changed {
-                notes.push("registered MCP servers in ~/.claude.json".into());
+    // 1) PRIMARY: install as a Claude Code plugin (skills + MCP, both via the plugin).
+    let plugin_ok = if has_claude_cli() {
+        match install_plugin_via_cli(app, &vibe_url, &mut notes) {
+            Ok(true) => {
+                skill_installed = true;
+                mcp_registered = true; // the plugin bundles + auto-registers the vibe-extract MCP
+                skill_path =
+                    dirs_home().join(".vibe-extract").join("plugin").join("replicate-ui").display().to_string();
+                // Remove the legacy loose skills so /replicate-ui isn't defined twice.
+                let sk = dirs_home().join(".claude").join("skills");
+                for n in ["replicate-ui", "replicate-ui-watch"] {
+                    let _ = std::fs::remove_dir_all(sk.join(n));
+                }
+                true
             }
-            true
+            Ok(false) => false,
+            Err(e) => {
+                notes.push(format!("plugin install: {e}"));
+                false
+            }
         }
-        Err(e) => {
-            notes.push(format!("MCP registration: {e}"));
-            false
-        }
+    } else {
+        notes.push("`claude` CLI not on PATH — used loose-skill fallback (install Claude Code for the plugin)".into());
+        false
     };
+
+    // 2) FALLBACK: legacy loose-skill copy + MCP merge (only if the plugin path failed).
+    if !plugin_ok {
+        let skills_dir = dirs_home().join(".claude").join("skills");
+        std::fs::create_dir_all(&skills_dir).map_err(|e| e.to_string())?;
+        for name in ["replicate-ui", "replicate-ui-watch"] {
+            if let Some(src) = bundled_skill(app, name) {
+                let dst = skills_dir.join(name);
+                let _ = std::fs::remove_dir_all(&dst);
+                match copy_tree(&src, &dst) {
+                    Ok(_) => {
+                        if name == "replicate-ui" {
+                            skill_installed = true;
+                            skill_path = dst.display().to_string();
+                        }
+                    }
+                    Err(e) => notes.push(format!("copy {name} failed: {e}")),
+                }
+            } else if name == "replicate-ui" {
+                notes.push("bundled replicate-ui skill not found".into());
+            }
+        }
+        mcp_registered = match register_mcp_servers(&vibe_url) {
+            Ok(changed) => {
+                if changed {
+                    notes.push("registered MCP servers in ~/.claude.json".into());
+                }
+                true
+            }
+            Err(e) => {
+                notes.push(format!("MCP registration: {e}"));
+                false
+            }
+        };
+    }
 
     // 3) best-effort deps (don't block; just report what's missing)
     let mut pillow_ok = has_pillow();

@@ -22,6 +22,11 @@ if ! security find-certificate -c "$IDENTITY_NAME" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Assemble the bundled /replicate-ui plugin marketplace from the canonical skills
+# (resources/plugin/) so the shipped .app always carries the current plugin + MCP config.
+echo "==> build-plugin.py (assemble the bundled /replicate-ui plugin)"
+python3 "$(dirname "$0")/build-plugin.py"
+
 # The generated icon set (.icns/.ico/sized PNGs) is gitignored, so regenerate it
 # from the committed source icon.png on every build (idempotent, ~1s).
 echo "==> cargo tauri icon (regenerate icon set from icons/icon.png)"
