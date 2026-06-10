@@ -205,6 +205,24 @@ fn find_output_dir() -> PathBuf {
     dir
 }
 
+/// Frontend: the captures output folder as a display string (so the UI never
+/// hardcodes the path).
+#[tauri::command]
+fn output_dir_info() -> String {
+    find_output_dir().display().to_string()
+}
+
+/// Frontend: reveal the captures folder in Finder.
+#[tauri::command]
+fn reveal_output_dir() -> Result<(), String> {
+    let dir = find_output_dir();
+    std::process::Command::new("open")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ============================================================================
 // Claude Code integration — the app SELF-INSTALLS the /replicate-ui skill and
 // registers its MCP servers on launch, so distributing the .app is all anyone
@@ -3080,6 +3098,8 @@ pub fn run() {
             export_selection,
             extract_frontmost_window_cmd,
             save_to_disk,
+            output_dir_info,
+            reveal_output_dir,
             get_relaunch_dialog_info,
             relaunch_dialog_response,
             get_settings_cmd,

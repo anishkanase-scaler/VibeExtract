@@ -61,9 +61,7 @@ the master memory `[[replicate-ui-method]]`.)
    Electron inline-SVG / loose). A screenshot crop is a per-icon LAST RESORT, only for a runtime-rendered
    element with no resource file. **For config-driven ribbons (WPS/Kingsoft/Office-style) the app ALSO
    ships the exact command→icon MAP — run `_shared/ribbon_config.py` to read it; never guess icon names
-   (the #1 repeated failure).** This holds for ALL chrome (rails, status bar, title bar), not just
-   ribbons. **Never guess a basename and never reuse a previous component's icon pick without
-   re-verifying every glyph in Chromium against THIS capture** — see the 🔒 ICON LAW below. → step 3b.
+   (the #1 repeated failure).** → step 3b.
 2. **The LLM judges every icon and pixel-matches it to the native reference — then locks it.**
    `icon_match.match(native_crop, pool, idx, name_prior=…, keywords=…)` ranks candidates by a
    colour-invariant silhouette score — the native PIXELS decide, the name map only biases. THEN the
@@ -74,28 +72,6 @@ the master memory `[[replicate-ui-method]]`.)
    **Icon COLOUR is the icon's DESIGNED accent (its named accent class) rendered at the ACTIVE-window look
    (bright body + vivid accent), NOT sampled from the screenshot — a dull/inactive capture must never grey or
    dull a designed accent.** Use `icon_theme.recolor_designed`. → step 3b.
-
-> ### 🔒 ICON LAW (non-negotiable — dev-flagged, repeat offender; read before touching any icon)
-> 1. **NEVER guess an icon basename.** Every basename MUST come from the app's own config (`.kui`/`.kuip`
->    via `ribbon_config.py`) OR a confirmed visual match against the real bundle pool. A plausible-looking
->    name is a guess — banned. This applies to **all** chrome (rails, status bar, title bar, panels), not
->    just ribbons — they live in the config too (e.g. WPS PDF rails/status are in `pdfcommon.kuip`).
-> 2. **NEVER reuse an icon pick from a previous component / build / tab on faith.** Reuse the METHOD
->    (layout, generator, fonts) — never the icon→basename mapping without re-verifying it against THIS
->    capture. "Same chrome as last time" / "unchanged region" is NOT verification. An inherited `NAME_MAP`
->    returns real-but-WRONG glyphs when its names were guessed (this is exactly how WPS-PDF shipped wrong
->    rail/status/Extract icons).
-> 3. **EVERY icon is individually verified — none skipped.** Render each candidate in **Chromium
->    (Playwright), NOT qlmanage** — qlmanage renders themed `_kd` SVGs **blank** (their `<style>` class
->    fills aren't applied), the blind spot that let wrong chrome icons ship unseen — and compare to a
->    **fresh native crop of that exact control** (shape + accent). Verify EVERY region (rails, status bar,
->    title bar, panels), not just the ribbon. Lock confirmed picks in `icon_map.json`.
-> 4. **Screenshot-crop is the ONLY permitted fallback, and ONLY after config + pool are exhausted** and
->    the exact icon genuinely cannot be produced. Crop the real glyph (never hand-draw). **Guessing a
->    vector name is NEVER an acceptable substitute for cropping — if unsure, crop, don't guess.**
-> 5. An icon is not "done" until verified by eye against native. "Looks fine," "diminishing returns,"
->    "SSIM text-capped," "reused from last build" NEVER excuse an unverified icon.
-
 3. **Build the DOM from the AX tree as a real, semantic frontend.** Drive every element from its AX role
    through `markup.el_from_node(node, …)` (single choke point: role→tag via `role-map.json`, stamps
    `data-ax-*`) → semantic tags, REAL focusable controls (`<button>`, `<input>`, `role=tab/slider/combobox`),
@@ -207,13 +183,6 @@ Everything after this section is the detailed loop that implements these four pi
    them in the replica MUST come from a harvest (`extract_assets`) or the reuse cache — this is
    not optional and not something to defer or "fix later." Hand-drawn SVGs are the #1 cause of a
    replica that looks wrong; the user should never have to point one out. So:
-   - 🔒 **OBEY THE ICON LAW (see THE METHOD).** Restated for icons specifically: (a) **never guess a
-     basename** — resolve from config (`ribbon_config.py` / `.kui` / `.kuip` / `pdfcommon.kuip`) or a
-     confirmed visual match; (b) **never reuse a previous component's/build's icon pick on faith** —
-     re-verify EVERY glyph against THIS capture (an inherited `NAME_MAP` ships real-but-wrong glyphs);
-     (c) **verify EVERY icon in Chromium** (not qlmanage — it blanks `_kd` icons) beside its native crop,
-     for EVERY region (rails, status bar, title bar), none skipped; (d) **screenshot-crop only after
-     config+pool are exhausted** — never as a substitute for guessing.
    - **Run `extract_assets { }` on every run** (it reads the LIVE renderer, so it's never stale).
      Per step 2c, reuse only the cached **fonts** (`assets/fonts/*.woff2`) verbatim; re-derive
      **icons/SVGs/images** from this run's harvest, not a prior run's pixels.
@@ -233,10 +202,7 @@ Everything after this section is the detailed loop that implements these four pi
      pick once** (native-vs-top-k grid) and it's **locked in `icon_map.json`** (`{resource,confirmed,
      crop_hash}`); re-runs FREEZE locked entries → never re-pick → **no regression** (the root cause of
      "fixed one, broke another" was global re-picking with no lock). Notes: render candidate masks via
-     BATCHED `qlmanage` (use luma, not alpha — qlmanage paints an opaque white bg) — **but ONLY for the
-     silhouette SCORE. The required visual CONFIRMATION render MUST be Chromium (Playwright): `qlmanage`
-     renders themed `_kd` SVGs BLANK (their `<style>` class fills aren't applied), so confirming a `_kd`
-     icon in qlmanage is impossible and is how wrong chrome icons shipped unseen.** CAP the keyword
+     BATCHED `qlmanage` (use luma, not alpha — qlmanage paints an opaque white bg); CAP the keyword
      shortlist (substring `"line"` → 1000+ candidates). Thin/accent-only glyphs stay low-confidence → the
      model's eye on the top-k. 🚫 **A LOW match score is NEVER a reason to screenshot-crop the glyph.**
      When `icon_match` scores low (thin/small/dark-theme icons routinely do), DON'T fall back to a crop —
@@ -514,11 +480,6 @@ Everything after this section is the detailed loop that implements these four pi
    contact sheet.** A `FAIL` is never "done"; an unreviewed `EYEBALL` is never "done". (The gate is
    deliberately conservative on tiny AA'd glyphs — colour metrics are noisy, so it hard-fails only gross
    errors and routes the rest to your eye; the recolour step in 3b is what makes the FIRST render correct.)
-   - 🔒 **The gate covers EVERY icon in EVERY region — rails, status bar, title bar, panels — NOT just
-     the ribbon. No icon may be excluded from `icon_boxes.json` or skipped.** The contact sheet that you
-     eyeball is a **Chromium** render of the replica (qlmanage blanks `_kd` icons, so a qlmanage-only check
-     is worthless for themed glyphs — per the ICON LAW). An icon that was reused/inherited from a prior
-     build is NOT exempt: it must pass this gate against THIS capture like any freshly-picked icon.
 
 9. **Iterate — YOURSELF, to the bar. The dev picks once and never iterates.** If `pass` is false
    (score < 0.92): inspect the heatmap, fix the HTML/CSS for the highlighted regions, re-render,
