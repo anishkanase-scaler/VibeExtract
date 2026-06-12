@@ -39,14 +39,14 @@
       border-radius: 4px;
     }
     .outline.selected {
-      /* Indigo dashed for selected — same blue family, clearly distinct hue
+      /* Violet dashed for selected — morpho-wing iridescence, clearly distinct
          from the solid sky hover. */
-      border: 3px dashed #818cf8;
-      background: rgba(129, 140, 248, 0.12);
+      border: 3px dashed #8b5cf6;
+      background: rgba(139, 92, 246, 0.12);
       box-shadow:
         0 0 0 1px rgba(0,0,0,0.45),
         0 0 0 2px rgba(255,255,255,0.45),
-        0 0 28px rgba(129, 140, 248, 0.65);
+        0 0 28px rgba(139, 92, 246, 0.65);
       z-index: 5;
       border-radius: 4px;
     }
@@ -73,7 +73,7 @@
     }
     .outline-label.selected {
       z-index: 6;
-      background: linear-gradient(135deg, #818cf8, #2563eb);
+      background: linear-gradient(135deg, #a78bfa, #6d28d9);
       color: white;
     }
 
@@ -160,7 +160,7 @@
        the default above is bottom-anchored). */
     .hud.at-top { top: 40px; bottom: auto; }
     .hud strong {
-      background: linear-gradient(135deg, #f0f9ff, #7dd3fc 60%, #38bdf8);
+      background: linear-gradient(120deg, #f0f9ff, #7dd3fc 40%, #00e5ff 60%, #a78bfa);
       -webkit-background-clip: text;
       background-clip: text;
       -webkit-text-fill-color: transparent;
@@ -170,7 +170,7 @@
     .hud .count {
       display: inline-flex;
       align-items: center;
-      background: linear-gradient(135deg, #7dd3fc, #38bdf8);
+      background: linear-gradient(135deg, #7dd3fc, #38bdf8 55%, #a78bfa);
       color: #061021;
       padding: 3px 10px;
       border-radius: 999px;

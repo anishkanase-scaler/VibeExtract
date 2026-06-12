@@ -1598,6 +1598,7 @@ async fn export_selection(app: AppHandle) -> Result<ExportPayload, String> {
     // doesn't capture our own HUD/outline pixels. NOTE: do NOT move the
     // window off-screen — that's been observed to "stick" so the overlay
     // doesn't come back properly on the next start_pick_mode call.
+    let t_export = std::time::Instant::now();
     if let Some(overlay) = app.get_webview_window("overlay") {
         let _ = overlay.set_ignore_cursor_events(true);
         let _ = overlay.hide();
@@ -1609,7 +1610,7 @@ async fn export_selection(app: AppHandle) -> Result<ExportPayload, String> {
     );
 
     let first_attempt = dispatcher::extract_multi(&selected, CONTENT_SCRIPT, &out_dir).await;
-    let result = match first_attempt {
+    let mut result = match first_attempt {
         Ok(r) => r,
         Err(ExtractError::ElectronNeedsRelaunch {
             bundle_id,
@@ -1656,6 +1657,10 @@ async fn export_selection(app: AppHandle) -> Result<ExportPayload, String> {
         }
         Err(e) => return Err(e.to_string()),
     };
+    result.diagnostics.push(format!(
+        "export total {}ms (incl. 180ms overlay settle)",
+        t_export.elapsed().as_millis()
+    ));
 
     // SOFT reset: keep pick mode active (overlay visible, event tap installed,
     // Esc still bound) so the user can immediately click another element and
