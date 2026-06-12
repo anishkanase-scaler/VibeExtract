@@ -28,20 +28,30 @@ struct CdpCommand {
 }
 
 /// Discover a CDP debug port on localhost in 9220..9230 by probing /json/version.
+/// All ports are probed CONCURRENTLY (worst case ~250ms instead of the old
+/// sequential 11 × 250ms = 2.75s — the common pre-relaunch Electron case is
+/// "no port open", which used to eat the full 2.75s before the relaunch
+/// dialog could even appear). Lowest open port wins, deterministically.
 pub async fn discover_port() -> Option<u16> {
-    for p in 9220u16..=9230 {
-        if let Ok(resp) = reqwest::Client::new()
-            .get(format!("http://127.0.0.1:{p}/json/version"))
-            .timeout(Duration::from_millis(250))
-            .send()
-            .await
-        {
-            if resp.status().is_success() {
-                return Some(p);
-            }
+    let client = reqwest::Client::new(); // one client, shared pool (Arc-backed)
+    let probes = (9220u16..=9230).map(|p| {
+        let client = client.clone();
+        async move {
+            client
+                .get(format!("http://127.0.0.1:{p}/json/version"))
+                .timeout(Duration::from_millis(250))
+                .send()
+                .await
+                .ok()
+                .filter(|r| r.status().is_success())
+                .map(|_| p)
         }
-    }
-    None
+    });
+    futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 async fn discover_target(port: u16, index: usize) -> Result<String> {

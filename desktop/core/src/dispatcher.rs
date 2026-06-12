@@ -596,6 +596,17 @@ async fn native_extract_macos(
     use base64::Engine as _;
 
     std::fs::create_dir_all(out_dir)?;
+    let mut t = PhaseTimer::new();
+
+    // Kick off the screenshot FIRST — it only needs picked.bounds (known now)
+    // and the overlay is already hidden (the shell slept 180ms before calling
+    // us). The screencapture child races the AX work below as a separate OS
+    // process; by the time the walk finishes it has usually already exited,
+    // so its 80-200ms disappears from the critical path. Bonus: pixels are
+    // captured closer to pick time, before the target app repaints.
+    let png_path = out_dir.join("native-output.png");
+    let pending_shot = crate::screenshot::spawn_capture_region(picked.bounds, &png_path)?;
+    t.lap("shot-spawn");
 
     // Re-pick at multiple points in the bounds so we have a fresh AX handle
     // to walk children. Apps move/redraw between pick time and export time,
@@ -627,20 +638,27 @@ async fn native_extract_macos(
                 pid, picked.bounds
             )
         })?;
+    t.lap("repick");
+    // The walk is IPC-bound (one Mach round-trip per attribute batch) and the
+    // AXUIElement is non-Send, so it stays on this thread while the
+    // screencapture child runs concurrently as its own process.
     let mut node = crate::ax_macos::walk_node(&root_el, 12);
+    t.lap("walk");
 
-    let png_path = out_dir.join("native-output.png");
-    crate::screenshot::capture_region(picked.bounds, &png_path)?;
+    pending_shot.wait()?; // usually 0ms — finished while we walked the tree
+    t.lap("shot-wait");
     let img = image::open(&png_path)?.into_rgba8();
     fill_node_colors(&mut node, &img, picked.bounds);
 
     let mut palette = Vec::new();
     collect_palette(&node, &mut palette);
+    t.lap("sample");
 
     let toon = crate::native_format::emit_toon(&node, &palette, picked, bundle.as_ref());
     let png_bytes = std::fs::read(&png_path)?;
     let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
     let html = crate::native_format::emit_html(&node, &png_b64, picked.bounds);
+    t.lap("emit");
 
     let fidelity = if bundle.as_ref().map(|b| !b.nibs.is_empty()).unwrap_or(false) {
         "Native AX + NIB-resolved + sampled colors".to_string()
@@ -649,6 +667,7 @@ async fn native_extract_macos(
     };
 
     let mut diag = vec![format!("Captured {} AX nodes", crate::ax_macos::count_nodes(&node))];
+    diag.push(t.render());
     if let Some(b) = bundle.as_ref() {
         diag.push(format!("Bundle: {} nibs, assets_car={}", b.nibs.len(), b.assets_car_summary.is_some()));
         for d in &b.diagnostics {
@@ -667,4 +686,34 @@ async fn native_extract_macos(
         // This is the structured semantic spec; the TOON above is its text form.
         ax_tree: serde_json::to_string_pretty(&node).ok(),
     })
+}
+
+/// Lap timer for the extraction hot path. Renders one diagnostics line like
+/// `timing: shot-spawn 2ms · repick 14ms · walk 230ms · shot-wait 0ms ·
+/// sample 31ms · emit 12ms · total 289ms` so every optimization's gain (or
+/// regression) is visible in the app's Diagnostics tab without a profiler.
+struct PhaseTimer {
+    start: std::time::Instant,
+    last: std::time::Instant,
+    laps: Vec<(&'static str, u128)>,
+}
+
+impl PhaseTimer {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self { start: now, last: now, laps: Vec::new() }
+    }
+    fn lap(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        self.laps.push((name, (now - self.last).as_millis()));
+        self.last = now;
+    }
+    fn render(&self) -> String {
+        let mut s = String::from("timing: ");
+        for (name, ms) in &self.laps {
+            s.push_str(&format!("{name} {ms}ms · "));
+        }
+        s.push_str(&format!("total {}ms", self.start.elapsed().as_millis()));
+        s
+    }
 }

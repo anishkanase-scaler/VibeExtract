@@ -37,6 +37,74 @@ pub fn capture_region(bounds: ScreenRect, out_path: &Path) -> Result<()> {
     Ok(())
 }
 
+// --- Overlapped capture (latency) --------------------------------------------
+//
+// The extraction hot path wants the screencapture child RUNNING while the AX
+// tree walk happens on the calling thread (the AXUIElement is non-Send, the
+// child is a separate OS process — free concurrency). `spawn_capture_region`
+// starts the child; `PendingCapture::wait` joins it before the pixels are read.
+
+/// A screencapture child in flight. Reaps the child on drop so an early error
+/// return in the caller can't leak a zombie process.
+pub struct PendingCapture {
+    child: Option<std::process::Child>,
+    out_path: std::path::PathBuf,
+}
+
+/// Start `/usr/sbin/screencapture` for `bounds` WITHOUT waiting for it.
+#[cfg(target_os = "macos")]
+pub fn spawn_capture_region(bounds: ScreenRect, out_path: &Path) -> Result<PendingCapture> {
+    if !bounds.is_valid() {
+        bail!("zero-sized bounds: {:?}", bounds);
+    }
+    let region = format!("{:.0},{:.0},{:.0},{:.0}", bounds.x, bounds.y, bounds.w, bounds.h);
+    let child = std::process::Command::new("/usr/sbin/screencapture")
+        .args(["-x", "-R", &region])
+        .arg(out_path)
+        .spawn()
+        .context("spawning /usr/sbin/screencapture")?;
+    Ok(PendingCapture {
+        child: Some(child),
+        out_path: out_path.to_path_buf(),
+    })
+}
+
+/// Non-macOS fallback: capture synchronously up front; `wait()` is a no-op.
+#[cfg(not(target_os = "macos"))]
+pub fn spawn_capture_region(bounds: ScreenRect, out_path: &Path) -> Result<PendingCapture> {
+    capture_region(bounds, out_path)?;
+    Ok(PendingCapture {
+        child: None,
+        out_path: out_path.to_path_buf(),
+    })
+}
+
+impl PendingCapture {
+    /// Join the in-flight capture; errors mirror the blocking `capture_region`.
+    pub fn wait(mut self) -> Result<()> {
+        if let Some(mut child) = self.child.take() {
+            let status = child.wait().context("waiting on screencapture")?;
+            if !status.success() {
+                bail!("screencapture exited with status {:?}", status.code());
+            }
+        }
+        if !self.out_path.exists() {
+            bail!("screencapture didn't produce {}", self.out_path.display());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingCapture {
+    fn drop(&mut self) {
+        // Early-error path in the caller: reap so we never leave a zombie.
+        // screencapture self-terminates in well under a second.
+        if let Some(mut c) = self.child.take() {
+            let _ = c.wait();
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 const EMPTY_PNG: [u8; 67] = [
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,

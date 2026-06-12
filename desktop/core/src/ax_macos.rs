@@ -32,6 +32,10 @@ type AXError = i32;
 const K_AX_ERROR_SUCCESS: AXError = 0;
 const K_AX_VALUE_TYPE_CG_POINT: u32 = 1;
 const K_AX_VALUE_TYPE_CG_SIZE: u32 = 2;
+// AXUIElementCopyMultipleAttributeValues options: 0 = unsupported/missing
+// attributes come back per-slot (as AXValue(kAXValueTypeAXError) or kCFNull)
+// instead of failing the whole call — exactly what the name-fallback wants.
+const K_AX_COPY_MULTIPLE_NO_OPTIONS: u32 = 0;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -58,6 +62,15 @@ extern "C" {
     fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
     fn AXValueGetType(value: AXValueRef) -> u32;
     fn AXValueGetValue(value: AXValueRef, the_type: u32, value_ptr: *mut c_void) -> bool;
+    fn AXValueGetTypeID() -> usize;
+    /// One Mach round-trip for N attributes (vs N round-trips of
+    /// AXUIElementCopyAttributeValue) — the extraction walk's hot path.
+    fn AXUIElementCopyMultipleAttributeValues(
+        element: AXUIElementRef,
+        attributes: CFArrayRef,
+        options: u32,
+        values: *mut CFArrayRef,
+    ) -> AXError;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -186,6 +199,63 @@ impl AxElement {
         })
     }
 
+    /// Fetch all node attributes the extraction walk needs in ONE Mach IPC
+    /// round-trip via `AXUIElementCopyMultipleAttributeValues` (the
+    /// per-attribute path costs 8–10 round-trips per node, which dominates
+    /// extraction latency on big trees). Returns `None` when the batch call
+    /// itself fails (dead element, app without the multi-attribute API) —
+    /// the caller falls back to the per-attribute path so behaviour never
+    /// regresses.
+    pub fn batch_node_attrs(&self) -> Option<NodeAttrs> {
+        const NODE_ATTRS: [&str; 10] = [
+            "AXRole",
+            "AXSubrole",
+            "AXTitle",
+            "AXDescription",
+            "AXLabel",
+            "AXValue",
+            "AXIdentifier",
+            "AXRoleDescription",
+            "AXPosition",
+            "AXSize",
+        ];
+        let keys: Vec<CFString> = NODE_ATTRS.iter().map(|k| CFString::new(k)).collect();
+        let keys_arr = CFArray::from_CFTypes(&keys);
+        let mut values: CFArrayRef = std::ptr::null();
+        let err = unsafe {
+            AXUIElementCopyMultipleAttributeValues(
+                self.0,
+                keys_arr.as_concrete_TypeRef(),
+                K_AX_COPY_MULTIPLE_NO_OPTIONS,
+                &mut values,
+            )
+        };
+        if err != K_AX_ERROR_SUCCESS || values.is_null() {
+            return None;
+        }
+        // Copy rule: WE own the returned array — wrap under the create rule so
+        // it's released exactly once on drop. Its ELEMENTS are +0 borrows owned
+        // by the array: never CFRelease them; the decoders retain (get rule)
+        // only what they keep.
+        let arr = unsafe { CFArray::<*const c_void>::wrap_under_create_rule(values) };
+        if arr.len() as usize != NODE_ATTRS.len() {
+            return None; // defensive: result must align 1:1 with the input order
+        }
+        let get = |i: isize| -> *const c_void { arr.get(i).map(|r| *r).unwrap_or(std::ptr::null()) };
+        Some(NodeAttrs {
+            role: cf_to_string(get(0)),
+            subrole: cf_to_string(get(1)),
+            title: cf_to_string(get(2)),
+            description: cf_to_string(get(3)),
+            label: cf_to_string(get(4)),
+            value: cf_to_string(get(5)),
+            identifier: cf_to_string(get(6)),
+            role_description: cf_to_string(get(7)),
+            position: cf_to_point(get(8)),
+            size: cf_to_size(get(9)),
+        })
+    }
+
     pub fn array_attr(&self, key: &str) -> Vec<AxElement> {
         let key_cf = CFString::new(key);
         let mut value: CFTypeRef = std::ptr::null();
@@ -279,6 +349,80 @@ impl AxElement {
         }
         None
     }
+}
+
+/// All node attributes the extraction walk consumes, fetched in one batched
+/// IPC by [`AxElement::batch_node_attrs`].
+pub struct NodeAttrs {
+    pub role: Option<String>,
+    pub subrole: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub label: Option<String>,
+    pub value: Option<String>,
+    pub identifier: Option<String>,
+    pub role_description: Option<String>,
+    pub position: Option<ScreenPoint>,
+    pub size: Option<(f64, f64)>,
+}
+
+// Slot decoders for the batched result array. All take +0 borrows (the array
+// owns each element and releases it when the array drops) — so unlike
+// `str_attr`/`point_attr`/`size_attr`, they must NOT CFRelease. Missing or
+// unsupported attributes arrive as AXValue(kAXValueTypeAXError) or kCFNull;
+// both fail the type gates below and decode to None — matching the
+// per-attribute helpers' "unexpected type means None" semantics.
+
+fn cf_to_string(v: *const c_void) -> Option<String> {
+    if v.is_null() {
+        return None;
+    }
+    if unsafe { CFGetTypeID(v) } != CFString::type_id() {
+        return None;
+    }
+    // wrap_under_get_rule RETAINS — required: the array owns v.
+    Some(unsafe { CFString::wrap_under_get_rule(v as CFStringRef) }.to_string())
+}
+
+fn cf_to_point(v: *const c_void) -> Option<ScreenPoint> {
+    if v.is_null() || unsafe { CFGetTypeID(v) } != unsafe { AXValueGetTypeID() } {
+        return None;
+    }
+    if unsafe { AXValueGetType(v as AXValueRef) } != K_AX_VALUE_TYPE_CG_POINT {
+        return None; // also rejects AXValue(kAXValueTypeAXError) slots
+    }
+    let mut pt = CGPoint { x: 0.0, y: 0.0 };
+    let ok = unsafe {
+        AXValueGetValue(
+            v as AXValueRef,
+            K_AX_VALUE_TYPE_CG_POINT,
+            &mut pt as *mut CGPoint as *mut c_void,
+        )
+    };
+    ok.then(|| ScreenPoint { x: pt.x, y: pt.y })
+}
+
+fn cf_to_size(v: *const c_void) -> Option<(f64, f64)> {
+    #[repr(C)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+    if v.is_null() || unsafe { CFGetTypeID(v) } != unsafe { AXValueGetTypeID() } {
+        return None;
+    }
+    if unsafe { AXValueGetType(v as AXValueRef) } != K_AX_VALUE_TYPE_CG_SIZE {
+        return None;
+    }
+    let mut sz = CGSize { width: 0.0, height: 0.0 };
+    let ok = unsafe {
+        AXValueGetValue(
+            v as AXValueRef,
+            K_AX_VALUE_TYPE_CG_SIZE,
+            &mut sz as *mut CGSize as *mut c_void,
+        )
+    };
+    ok.then(|| (sz.width, sz.height))
 }
 
 // --- Permission / cursor / hit-test ------------------------------------------
@@ -752,22 +896,54 @@ pub fn walk_node(el: &AxElement, max_depth: u32) -> Node {
 }
 
 fn capture_node(el: &AxElement, depth: u32, max_depth: u32) -> Node {
-    let role = el.str_attr("AXRole").unwrap_or_else(|| "AXUnknown".into());
-    let subrole = el.str_attr("AXSubrole").filter(|s| !s.is_empty());
-    let name = el
-        .str_attr("AXTitle")
-        .or_else(|| el.str_attr("AXDescription"))
-        .or_else(|| el.str_attr("AXLabel"))
-        .or_else(|| el.str_attr("AXValue"))
-        .unwrap_or_default();
-    let identifier = el.str_attr("AXIdentifier").filter(|s| !s.is_empty());
-    let value = el
-        .str_attr("AXValue")
-        .filter(|s| !s.is_empty() && Some(s) != Some(&name));
-    let role_description = el
-        .str_attr("AXRoleDescription")
-        .filter(|s| !s.is_empty());
-    let bounds = el.rect();
+    // One batched IPC for all 10 node attributes (the per-attribute path costs
+    // 8–10 Mach round-trips per node — THE extraction-latency hot spot on big
+    // trees). Name fallback priority is identical: Title → Description → Label
+    // → Value. Falls back to the per-attribute path when the batch call fails
+    // outright (dying element, app without the multi-attribute API).
+    let (role, subrole, name, identifier, value, role_description, bounds) =
+        match el.batch_node_attrs() {
+            Some(a) => {
+                let name = a
+                    .title
+                    .or(a.description)
+                    .or(a.label)
+                    .or_else(|| a.value.clone())
+                    .unwrap_or_default();
+                let value = a.value.filter(|s| !s.is_empty() && *s != name);
+                let bounds = match (a.position, a.size) {
+                    (Some(pt), Some((w, h))) => Some(ScreenRect { x: pt.x, y: pt.y, w, h }),
+                    _ => None,
+                };
+                (
+                    a.role.unwrap_or_else(|| "AXUnknown".into()),
+                    a.subrole.filter(|s| !s.is_empty()),
+                    name,
+                    a.identifier.filter(|s| !s.is_empty()),
+                    value,
+                    a.role_description.filter(|s| !s.is_empty()),
+                    bounds,
+                )
+            }
+            None => {
+                let role = el.str_attr("AXRole").unwrap_or_else(|| "AXUnknown".into());
+                let subrole = el.str_attr("AXSubrole").filter(|s| !s.is_empty());
+                let name = el
+                    .str_attr("AXTitle")
+                    .or_else(|| el.str_attr("AXDescription"))
+                    .or_else(|| el.str_attr("AXLabel"))
+                    .or_else(|| el.str_attr("AXValue"))
+                    .unwrap_or_default();
+                let identifier = el.str_attr("AXIdentifier").filter(|s| !s.is_empty());
+                let value = el
+                    .str_attr("AXValue")
+                    .filter(|s| !s.is_empty() && Some(s) != Some(&name));
+                let role_description = el
+                    .str_attr("AXRoleDescription")
+                    .filter(|s| !s.is_empty());
+                (role, subrole, name, identifier, value, role_description, el.rect())
+            }
+        };
 
     let mut children = Vec::new();
     let mut child_source: Option<String> = None;
