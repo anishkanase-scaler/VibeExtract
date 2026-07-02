@@ -33,7 +33,11 @@ echo "==> cargo tauri icon (regenerate icon set from icons/icon.png)"
 cargo tauri icon src-tauri/icons/icon.png
 
 echo "==> cargo tauri build (release; this takes a few minutes)"
-cargo tauri build
+# Only bundle the .app. Tauri's built-in DMG (bundle_dmg.sh) runs a Finder-driven
+# AppleScript to prettify the DMG window, which fails in non-GUI/automation
+# environments. We repackage the .dmg ourselves below (plain hdiutil, no Finder),
+# so Tauri's DMG would be discarded anyway — skip it to keep the build headless-safe.
+cargo tauri build --bundles app
 
 BUNDLE_DIR="src-tauri/target/release/bundle"
 APP=$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' 2>/dev/null | head -1)
