@@ -67,8 +67,10 @@ the master memory `[[replicate-ui-method]]`.)
    colour-invariant silhouette score — the native PIXELS decide, the name map only biases. THEN the
    **LLM vision gate is a REQUIRED step**: view the native crop beside the top-k and confirm each pick
    once by eye (shape + accent colours) — the score narrows but doesn't settle the final look (thin /
-   accent-only glyphs stay low-confidence). Lock every confirmed pick in `icon_map.json`
-   (`{resource,confirmed,crop_hash}`); re-runs FREEZE locked entries → never re-pick → no regression. → step 3b.
+   accent-only glyphs stay low-confidence). Lock every confirmed pick in `icon_map.json` **via
+   `icon_match.confirm_pick` or the gate's `--update-locks` — NEVER a raw `json.dump`** (that clobbered
+   maps and never recorded `crop_hash`, so locks silently didn't hold). On later pages/runs, triage each
+   entry with `icon_match.lock_decision` → reuse / reverify-via-gate / repick. → step 3b.
    **Icon COLOUR is the icon's DESIGNED accent (its named accent class) rendered at the ACTIVE-window look
    (bright body + vivid accent), NOT sampled from the screenshot — a dull/inactive capture must never grey or
    dull a designed accent.** Use `icon_theme.recolor_designed`. → step 3b.
@@ -161,6 +163,20 @@ Everything after this section is the detailed loop that implements these four pi
    First page of an app → nothing cached → full cost. Thereafter you save the *method* (no
    re-measuring layout, no re-OCR, no re-harvesting fonts) — but pixels are always fresh.
 
+   **WARM START (pages 2+ of the SAME app) — reuse is allowed only after THIS page verifies it:**
+   - ✅ **Icon pool**: call `resource_extract.extract_pool(app_path, cache_dir="pool")` — it
+     fingerprints the bundle (path + version + resource mtimes) and skips re-extraction (the slowest
+     harvest step) when the app hasn't changed. Safe by construction: the pool comes from the app
+     BUNDLE, never from a previous page's screenshots; any bundle change re-extracts.
+   - ✅ **Locked icons**: capture the fresh window FIRST, then triage every `icon_map.json` entry with
+     `icon_match.lock_decision` (see 3b). `reuse`/`reverify` skip the per-icon confirm round entirely —
+     the `reverify` list just needs one `icon_gate.py … --only <list> --update-locks icon_map.json`
+     pass against the fresh capture after the first render. A reused icon that hasn't gate-PASSED
+     this page is an UNVERIFIED icon — it never ships.
+   - ❌ Colours, window screenshots, sprite crops: fresh every page, exactly as above. The golden
+     rule is unchanged — the fresh capture stays the single source of truth; caching only ever skips
+     RE-DERIVATION, never the verification.
+
 3. **Inventory.** `ax_tree { pid, window_index: 0 }` → the component tree (roles,
    names, values, per-node `bounds`). This is your structural source of truth — a
    screenshot can't give you roles/labels. For Electron apps the AX tree may be
@@ -200,8 +216,18 @@ Everything after this section is the detailed loop that implements these four pi
      keywords=[…])` ranks candidates by **colour-invariant silhouette score** — the native PIXELS decide,
      the name map only shortlists/biases (a clearly-better visual match wins). The model **confirms each
      pick once** (native-vs-top-k grid) and it's **locked in `icon_map.json`** (`{resource,confirmed,
-     crop_hash}`); re-runs FREEZE locked entries → never re-pick → **no regression** (the root cause of
-     "fixed one, broke another" was global re-picking with no lock). Notes: render candidate masks via
+     crop_hash}`). **HOW TO LOCK (mechanical, not prose):** the ONLY sanctioned writers are
+     `icon_match.confirm_pick(map_path, name, resource, native_crop)` and the gate's
+     `icon_gate.py … --update-locks icon_map.json` (which locks every PASS icon with this run's located
+     native crop). 🚫 NEVER `json.dump` over `icon_map.json` from a generator — that clobbers entries and
+     skips `crop_hash`, which made every "lock" silently inert (the Photoshop run shipped 61/61 hashless
+     entries). **On later pages/re-runs**, triage each control with
+     `icon_match.lock_decision(entry, crop_hash(fresh_crop), pool_idx)`:
+     `reuse` (capture byte-identical — place it, free) · `reverify` (the NORMAL cross-page case: place the
+     locked resource, then it must gate-PASS against THIS page's capture via
+     `icon_gate.py … --only <names> --update-locks icon_map.json` — never reuse on faith) · `repick`
+     (no confirmed entry / resource gone from the fresh pool → full pipeline). This is what kills
+     "fixed one, broke another" AND makes pages 2+ fast without trusting stale pixels. Notes: render candidate masks via
      BATCHED `qlmanage` (use luma, not alpha — qlmanage paints an opaque white bg); CAP the keyword
      shortlist (substring `"line"` → 1000+ candidates). Thin/accent-only glyphs stay low-confidence → the
      model's eye on the top-k. 🚫 **A LOW match score is NEVER a reason to screenshot-crop the glyph.**
@@ -210,6 +236,15 @@ Everything after this section is the detailed loop that implements these four pi
      `Pdf_*`; themed app icons end `_kd`), then eyeball native-vs-candidate to confirm the exact glyph
      (e.g. WPS-PDF "Shapes" draws a *line* → `DrawLine`; "Note" is a bubble+plus → `bubble_add_kd`). The
      visual score is a tie-breaker, not the decider. See [[replicate-ui-real-icons-first-never-screenshot]].
+     **THE LAST RESORT — a CLEAN Retina crop (allowed, but only here):** when, AFTER pool matching +
+     direct-mapping + recolour, an icon STILL fails the gate (or its EYEBALL tile is visibly a different
+     glyph — in practice ~1–2 icons in 10), stop fighting the pool: crop that one control from the
+     **FRESH window capture at full device resolution** via `sprite.SpriteSlicer` (never a pre-scaled
+     screenshot), tight-cropped to the glyph box the gate already located, and render it at point size
+     (`width:Wpx` on the 2× image) so it stays crisp. The app's own pixels are correct by definition —
+     this preserves quality precisely where resource matching can't. It must still pass the gate (it
+     will), and it must come from THIS run's capture, never a previous page's. What stays forbidden is
+     using crops as a shortcut INSTEAD of pool extraction, or reusing an old crop.
      This is HOW you pick from the real resources below:
    - **For ANY native app (no CDP — Office, Finder, WPS, Mail, System Settings…) the icons are REAL
      resource files inside the app's INSTALL BUNDLE. Extract those. A screenshot crop is a LAST
@@ -470,8 +505,12 @@ Everything after this section is the detailed loop that implements these four pi
    repeatedly shipped wrong, so this is not judgment — it's a command you MUST run and show. Your
    generator emits **`icon_boxes.json`** (`{name:[x,y,w,h]}` — each icon's box in the render; you know
    every position) and renders the replica at the native region's point size, then runs
-   **`python3 "<skill-base>/_shared/icon_gate.py" <native>.png <replica>.png icon_boxes.json`** (wire it
-   as the LAST step of the build so it can't be skipped — see `.replicate-ui/wps/build_tools.py`). The
+   **`python3 "<skill-base>/_shared/icon_gate.py" <native>.png <replica>.png icon_boxes.json
+   --update-locks icon_map.json`** (wire it as the LAST step of the build so it can't be skipped — see
+   `.replicate-ui/wps/build_tools.py`). `--update-locks` writes/refreshes the lock (with `crop_hash` of
+   this run's located native crop) for every PASS icon — this is how locks get recorded at all; an
+   EYEBALL you confirm by eye must then be locked explicitly via `icon_match.confirm_pick`. On warm
+   pages add `--only name1,name2,…` to gate just the reused subset (step 2c). The
    gate template-LOCATES each native glyph (slides the clean replica glyph — never a fixed box, which
    catches label text), compares shape + body/accent colour, writes a native|replica **contact sheet**
    (`_icon_gate.png`), and exits: **0** all PASS · **1** a gross colour FAIL (fix + rebuild) · **2** some

@@ -32,6 +32,7 @@ type AXError = i32;
 const K_AX_ERROR_SUCCESS: AXError = 0;
 const K_AX_VALUE_TYPE_CG_POINT: u32 = 1;
 const K_AX_VALUE_TYPE_CG_SIZE: u32 = 2;
+const K_AX_VALUE_TYPE_CG_RECT: u32 = 3;
 // AXUIElementCopyMultipleAttributeValues options: 0 = unsupported/missing
 // attributes come back per-slot (as AXValue(kAXValueTypeAXError) or kCFNull)
 // instead of failing the whole call — exactly what the name-fallback wants.
@@ -71,6 +72,10 @@ extern "C" {
         options: u32,
         values: *mut CFArrayRef,
     ) -> AXError;
+    /// Set on the system-wide element this changes the GLOBAL reply timeout
+    /// for every AX message this process sends — a hung/busy target app then
+    /// fails fast instead of stalling each attribute read at the ~6s default.
+    fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_seconds: f32) -> AXError;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -83,6 +88,13 @@ extern "C" {
 extern "C" {
     fn CFRetain(cf: *const c_void) -> *const c_void;
     fn CFArrayGetTypeID() -> usize;
+    /// Identity hash for walk-time dedup: two AXUIElementRefs for the same
+    /// on-screen element hash (and compare) equal even when the pointers
+    /// differ.
+    fn CFHash(cf: *const c_void) -> usize;
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(boolean: *const c_void) -> bool;
+    fn CFNumberGetTypeID() -> usize;
 }
 
 // --- Safe wrappers -----------------------------------------------------------
@@ -188,7 +200,18 @@ impl AxElement {
         }
     }
 
+    /// Identity hash (CFHash) — equal for two refs to the same element, used
+    /// to dedupe merged child relations and to break walk cycles.
+    pub fn id_hash(&self) -> usize {
+        unsafe { CFHash(self.0) }
+    }
+
     pub fn rect(&self) -> Option<ScreenRect> {
+        // AXFrame is one attribute read + decode where position+size is two.
+        // Not every app implements it, so fall back to the classic pair.
+        if let Some(r) = self.frame_attr("AXFrame") {
+            return Some(r);
+        }
         let pt = self.point_attr("AXPosition")?;
         let (w, h) = self.size_attr("AXSize")?;
         Some(ScreenRect {
@@ -199,6 +222,39 @@ impl AxElement {
         })
     }
 
+    fn frame_attr(&self, key: &str) -> Option<ScreenRect> {
+        #[repr(C)]
+        struct CGRectFFI {
+            x: f64,
+            y: f64,
+            w: f64,
+            h: f64,
+        }
+        let key_cf = CFString::new(key);
+        let mut value: CFTypeRef = std::ptr::null();
+        let err =
+            unsafe { AXUIElementCopyAttributeValue(self.0, key_cf.as_concrete_TypeRef(), &mut value) };
+        if err != K_AX_ERROR_SUCCESS || value.is_null() {
+            return None;
+        }
+        if unsafe { CFGetTypeID(value) } != unsafe { AXValueGetTypeID() }
+            || unsafe { AXValueGetType(value as AXValueRef) } != K_AX_VALUE_TYPE_CG_RECT
+        {
+            unsafe { CFRelease(value) };
+            return None;
+        }
+        let mut r = CGRectFFI { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+        let ok = unsafe {
+            AXValueGetValue(
+                value as AXValueRef,
+                K_AX_VALUE_TYPE_CG_RECT,
+                &mut r as *mut CGRectFFI as *mut c_void,
+            )
+        };
+        unsafe { CFRelease(value) };
+        ok.then(|| ScreenRect { x: r.x, y: r.y, w: r.w, h: r.h })
+    }
+
     /// Fetch all node attributes the extraction walk needs in ONE Mach IPC
     /// round-trip via `AXUIElementCopyMultipleAttributeValues` (the
     /// per-attribute path costs 8–10 round-trips per node, which dominates
@@ -207,7 +263,7 @@ impl AxElement {
     /// the caller falls back to the per-attribute path so behaviour never
     /// regresses.
     pub fn batch_node_attrs(&self) -> Option<NodeAttrs> {
-        const NODE_ATTRS: [&str; 10] = [
+        const NODE_ATTRS: [&str; 16] = [
             "AXRole",
             "AXSubrole",
             "AXTitle",
@@ -218,6 +274,15 @@ impl AxElement {
             "AXRoleDescription",
             "AXPosition",
             "AXSize",
+            // UI-state flags the replica must mirror (selected tab, disabled
+            // button, focused field, expanded row). Same batch, zero extra IPC.
+            "AXFocused",
+            "AXSelected",
+            "AXEnabled",
+            "AXExpanded",
+            // Range endpoints for sliders / progress bars / scroll bars.
+            "AXMinValue",
+            "AXMaxValue",
         ];
         let keys: Vec<CFString> = NODE_ATTRS.iter().map(|k| CFString::new(k)).collect();
         let keys_arr = CFArray::from_CFTypes(&keys);
@@ -248,11 +313,17 @@ impl AxElement {
             title: cf_to_string(get(2)),
             description: cf_to_string(get(3)),
             label: cf_to_string(get(4)),
-            value: cf_to_string(get(5)),
+            value: cf_to_value_string(get(5)),
             identifier: cf_to_string(get(6)),
             role_description: cf_to_string(get(7)),
             position: cf_to_point(get(8)),
             size: cf_to_size(get(9)),
+            focused: cf_to_bool(get(10)),
+            selected: cf_to_bool(get(11)),
+            enabled: cf_to_bool(get(12)),
+            expanded: cf_to_bool(get(13)),
+            min_value: cf_to_f64(get(14)),
+            max_value: cf_to_f64(get(15)),
         })
     }
 
@@ -364,6 +435,12 @@ pub struct NodeAttrs {
     pub role_description: Option<String>,
     pub position: Option<ScreenPoint>,
     pub size: Option<(f64, f64)>,
+    pub focused: Option<bool>,
+    pub selected: Option<bool>,
+    pub enabled: Option<bool>,
+    pub expanded: Option<bool>,
+    pub min_value: Option<f64>,
+    pub max_value: Option<f64>,
 }
 
 // Slot decoders for the batched result array. All take +0 borrows (the array
@@ -425,6 +502,44 @@ fn cf_to_size(v: *const c_void) -> Option<(f64, f64)> {
     ok.then(|| (sz.width, sz.height))
 }
 
+fn cf_to_bool(v: *const c_void) -> Option<bool> {
+    if v.is_null() || unsafe { CFGetTypeID(v) } != unsafe { CFBooleanGetTypeID() } {
+        return None;
+    }
+    Some(unsafe { CFBooleanGetValue(v) })
+}
+
+fn cf_to_f64(v: *const c_void) -> Option<f64> {
+    if v.is_null() || unsafe { CFGetTypeID(v) } != unsafe { CFNumberGetTypeID() } {
+        return None;
+    }
+    let mut out: f64 = 0.0;
+    let ok = unsafe {
+        CFNumberGetValue(v as CFNumberRef, K_CF_NUMBER_DOUBLE, &mut out as *mut f64 as *mut c_void)
+    };
+    ok.then_some(out)
+}
+
+/// AXValue arrives as CFString for text, but as CFNumber for checkboxes /
+/// sliders / steppers and CFBoolean for toggles. `cf_to_string` silently
+/// dropped those (checkbox state was simply absent from the tree); stringify
+/// them instead so the replica can render the control's real state.
+fn cf_to_value_string(v: *const c_void) -> Option<String> {
+    if let Some(s) = cf_to_string(v) {
+        return Some(s);
+    }
+    if let Some(b) = cf_to_bool(v) {
+        return Some(if b { "1".into() } else { "0".into() });
+    }
+    if let Some(n) = cf_to_f64(v) {
+        if n.is_finite() && n == n.trunc() {
+            return Some(format!("{}", n as i64));
+        }
+        return Some(format!("{n}"));
+    }
+    None
+}
+
 // --- Permission / cursor / hit-test ------------------------------------------
 
 pub fn check_permission(prompt: bool) -> bool {
@@ -468,6 +583,24 @@ pub fn current_cursor() -> ScreenPoint {
 ///
 /// Call this once per pid the first time you encounter that pid in pick mode;
 /// the side-effect persists for the lifetime of the target process.
+/// Cap how long any single AX message may block waiting for the target app.
+/// Set once on the system-wide element, which makes it the process-global
+/// reply timeout — without it every attribute read on a hung/busy app stalls
+/// at the ~6s system default, turning one slow target into a frozen walk.
+pub fn set_ax_messaging_timeout() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let system = unsafe { AXUIElementCreateSystemWide() };
+        if system.is_null() {
+            return;
+        }
+        unsafe {
+            AXUIElementSetMessagingTimeout(system, 2.0);
+            CFRelease(system as *const _);
+        }
+    });
+}
+
 pub fn wake_app_ax(pid: i32) {
     if pid <= 0 {
         return;
@@ -658,6 +791,7 @@ pub fn element_at_in_app(point: ScreenPoint, app_pid: i32) -> Option<AxElement> 
 /// `PickedElement`. Bypasses CGWindowList entirely so Electron's helper-pid
 /// confusion is moot.
 pub fn pick_in_app(point: ScreenPoint, app_pid: i32) -> Result<PickedElement> {
+    set_ax_messaging_timeout();
     if !check_permission(false) {
         bail!("AX permission denied");
     }
@@ -665,7 +799,31 @@ pub fn pick_in_app(point: ScreenPoint, app_pid: i32) -> Result<PickedElement> {
     wake_app_ax(app_pid);
     let initial = element_at_in_app(point, app_pid)
         .ok_or_else(|| anyhow!("no AX element at ({},{}) in app pid {}", point.x, point.y, app_pid))?;
-    let el = deepen_at(initial, point);
+    let mut el = deepen_at(initial, point);
+    // The position API sometimes lands on a shallow container (menu bar, the
+    // whole window) even though the app's published tree has a real element
+    // under the cursor. Before giving up, resolve by walking the tree itself;
+    // keep the original element when the resolver can't do better (Electron's
+    // AX-opaque web content stays shallow on purpose — the CDP ladder owns it).
+    {
+        let role = el.str_attr("AXRole").unwrap_or_default();
+        let win = el.enclosing_window().and_then(|w| w.rect());
+        let shallow = match el.rect() {
+            Some(b) => is_shallow_pick(&role, &b, point, win.as_ref(), el.child_count()),
+            None => true,
+        };
+        if shallow {
+            if let Some(deep) = resolve_at_point(app_pid, point) {
+                let drole = deep.str_attr("AXRole").unwrap_or_default();
+                if let Some(db) = deep.rect() {
+                    let dwin = deep.enclosing_window().and_then(|w| w.rect());
+                    if !is_shallow_pick(&drole, &db, point, dwin.as_ref(), deep.child_count()) {
+                        el = deep;
+                    }
+                }
+            }
+        }
+    }
     let role = el.str_attr("AXRole").unwrap_or_else(|| "AXUnknown".into());
     let subrole = el.str_attr("AXSubrole").filter(|s| !s.is_empty());
     let name = el
@@ -716,7 +874,8 @@ pub fn deepen_at(start: AxElement, point: ScreenPoint) -> AxElement {
         // tables/outlines hide content under AXContents / AXRows / AXSections
         // rather than AXChildren. Shared with `capture_node` so the picker
         // descends as deeply as the tree walk does.
-        let (kids, _) = enumerate_children(&current);
+        let role = current.str_attr("AXRole").unwrap_or_default();
+        let (kids, _) = enumerate_children(&current, &role);
         // Find the child whose bounds tightly contain the point. If multiple
         // children match (e.g. overlapping), pick the smallest-area one — that
         // generally corresponds to the most specific leaf.
@@ -741,6 +900,96 @@ pub fn deepen_at(start: AxElement, point: ScreenPoint) -> AxElement {
         }
     }
     current
+}
+
+/// Hit-test by walking the app's AX tree from its root and returning the
+/// DEEPEST element whose frame contains `point` — a fallback for when
+/// `AXUIElementCopyElementAtPosition` returns a shallow container. The
+/// position API routes web-content hits through WebKit/Chromium's remote AX
+/// surface (or just returns the menu bar / window), while the tree walk stays
+/// on the host process's published tree — the same elements `walk_node` sees.
+///
+/// Tiebreak when several elements contain the point: deeper wins; equal depth
+/// → smaller area; equal area → non-container roles beat plain containers.
+/// Budgeted so a pathological tree can't stall the pick.
+pub fn resolve_at_point(pid: i32, point: ScreenPoint) -> Option<AxElement> {
+    const RESOLVE_BUDGET: usize = 20_000;
+    let app = app_element(pid).ok()?;
+
+    struct Best {
+        el: AxElement,
+        depth: u32,
+        area: f64,
+        is_container: bool,
+    }
+    fn is_container_role(role: &str) -> bool {
+        matches!(role, "AXGroup" | "AXSplitGroup" | "AXScrollArea" | "AXLayoutArea")
+    }
+
+    let mut best: Option<Best> = None;
+    let mut budget = RESOLVE_BUDGET;
+    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    fn visit(
+        el: AxElement,
+        depth: u32,
+        point: ScreenPoint,
+        budget: &mut usize,
+        visited: &mut std::collections::HashSet<usize>,
+        best: &mut Option<Best>,
+    ) {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if !visited.insert(el.id_hash()) {
+            return;
+        }
+        let role = el.str_attr("AXRole").unwrap_or_default();
+        if let Some(r) = el.rect() {
+            if r.contains(point) {
+                let area = r.w * r.h;
+                let is_container = is_container_role(&role);
+                let better = match best.as_ref() {
+                    None => true,
+                    Some(b) => {
+                        if depth != b.depth {
+                            depth > b.depth
+                        } else if area != b.area {
+                            area < b.area
+                        } else {
+                            !is_container && b.is_container
+                        }
+                    }
+                };
+                if better {
+                    // Keep our own retained ref; el continues into the walk.
+                    unsafe { CFRetain(el.0 as *const _) };
+                    *best = Some(Best { el: AxElement(el.0), depth, area, is_container });
+                }
+            }
+        }
+        let (kids, _) = enumerate_children(&el, &role);
+        for k in kids {
+            visit(k, depth + 1, point, budget, visited, best);
+        }
+    }
+
+    // Start at the app root (catches menu bar / status items reachable only
+    // there), then sweep the explicit window collections for apps that publish
+    // AXWindows but not AXChildren. The visited set makes the overlap free.
+    visit(app, 0, point, &mut budget, &mut visited, &mut best);
+    if let Ok(app2) = app_element(pid) {
+        for w in app2.array_attr("AXWindows") {
+            visit(w, 0, point, &mut budget, &mut visited, &mut best);
+        }
+        for key in ["AXMainWindow", "AXFocusedWindow"] {
+            if let Some(w) = app2.element_attr(key) {
+                visit(w, 0, point, &mut budget, &mut visited, &mut best);
+            }
+        }
+    }
+    best.map(|b| b.el)
 }
 
 /// Heuristic: did the AX hit-test fail to land on a real content element the
@@ -796,6 +1045,7 @@ pub fn is_shallow_pick(
 /// window doesn't return its own AXWebArea when the user hovers above another
 /// app's window).
 pub fn pick(point: ScreenPoint) -> Result<PickedElement> {
+    set_ax_messaging_timeout();
     if !check_permission(false) {
         bail!("AX permission denied — grant Accessibility access in System Settings then retry.");
     }
@@ -803,7 +1053,29 @@ pub fn pick(point: ScreenPoint) -> Result<PickedElement> {
     let initial = element_at_excluding(point, our_pid)
         .or_else(|| element_at(point))
         .ok_or_else(|| anyhow!("no AX element at ({}, {})", point.x, point.y))?;
-    let el = deepen_at(initial, point);
+    let mut el = deepen_at(initial, point);
+    // Same shallow-pick rescue as `pick_in_app`: when the position API lands
+    // on a menu bar / whole-window container, walk the app's own tree for the
+    // deepest element under the cursor before committing the shallow result.
+    if let Some(el_pid) = el.pid() {
+        let role = el.str_attr("AXRole").unwrap_or_default();
+        let win = el.enclosing_window().and_then(|w| w.rect());
+        let shallow = match el.rect() {
+            Some(b) => is_shallow_pick(&role, &b, point, win.as_ref(), el.child_count()),
+            None => true,
+        };
+        if shallow {
+            if let Some(deep) = resolve_at_point(el_pid, point) {
+                let drole = deep.str_attr("AXRole").unwrap_or_default();
+                if let Some(db) = deep.rect() {
+                    let dwin = deep.enclosing_window().and_then(|w| w.rect());
+                    if !is_shallow_pick(&drole, &db, point, dwin.as_ref(), deep.child_count()) {
+                        el = deep;
+                    }
+                }
+            }
+        }
+    }
     let role = el.str_attr("AXRole").unwrap_or_else(|| "AXUnknown".into());
     let subrole = el.str_attr("AXSubrole").filter(|s| !s.is_empty());
     let name = el
@@ -876,6 +1148,22 @@ pub struct Node {
     pub bounds: Option<ScreenRect>,
     /// Filled in by the sampling pass.
     pub bg: Option<(u8, u8, u8)>,
+    /// UI-state flags currently TRUE on the element: "focused", "selected",
+    /// "expanded", plus "disabled" when AXEnabled is explicitly false. An
+    /// absent flag means "not reported", not "false" — apps that don't
+    /// implement an attribute simply don't emit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state: Vec<String>,
+    /// Range endpoints for value-bearing roles (sliders, progress bars,
+    /// scroll bars, steppers) so the replica can position the thumb/fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_value: Option<f64>,
+    /// True when children were dropped here (per-role child cap or the
+    /// global node budget) — an honest "there is more under this node".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     /// Which AX relation produced this node's children when it wasn't the
     /// obvious AXChildren/AXVisibleChildren — e.g. "AXRows", "AXContents",
     /// "AXSections", or an "empty:…" honesty marker for an AX-opaque web
@@ -888,20 +1176,54 @@ pub struct Node {
 
 pub fn walk_subtree(point: ScreenPoint, max_depth: u32) -> Result<Node> {
     let root = element_at(point).ok_or_else(|| anyhow!("no AX element at point"))?;
-    Ok(capture_node(&root, 0, max_depth))
+    Ok(walk_node(&root, max_depth))
+}
+
+/// Hard ceiling on nodes per walk — a runaway-tree backstop far above any
+/// real window (Desktop_Pluck uses the same figure). When hit, the node where
+/// the budget ran out is flagged `truncated` instead of silently flattening.
+const WALK_NODE_BUDGET: usize = 100_000;
+
+/// Walk-shared state: cycle/dedup protection plus the node budget. AX trees
+/// can alias the same element under several relations (and, rarely, cycle
+/// via misbehaving apps) — `visited` guarantees each element is emitted once.
+struct WalkCtx {
+    visited: std::collections::HashSet<usize>,
+    nodes_left: usize,
 }
 
 pub fn walk_node(el: &AxElement, max_depth: u32) -> Node {
-    capture_node(el, 0, max_depth)
+    let mut ctx = WalkCtx {
+        visited: std::collections::HashSet::new(),
+        nodes_left: WALK_NODE_BUDGET,
+    };
+    ctx.visited.insert(el.id_hash());
+    capture_node(el, 0, max_depth, &mut ctx)
 }
 
-fn capture_node(el: &AxElement, depth: u32, max_depth: u32) -> Node {
+/// Per-role cap on how many children of one node are walked. Data containers
+/// get generous caps (a year calendar really has 365+ cells); leaf-ish roles
+/// get tight ones (an AXButton with 500 "children" is a broken tree, not UI).
+fn child_cap(role: &str) -> usize {
+    match role {
+        "AXOutline" | "AXTable" | "AXGrid" | "AXBrowser" => 10_000,
+        "AXRow" | "AXColumn" => 5_000,
+        "AXList" => 2_000,
+        "AXMenu" | "AXMenuBar" | "AXMenuBarItem" => 500,
+        "AXToolbar" | "AXTabGroup" | "AXSplitGroup" | "AXScrollArea" | "AXGroup" => 1_000,
+        "AXButton" | "AXMenuButton" | "AXStaticText" | "AXTextField" | "AXCheckBox"
+        | "AXRadioButton" | "AXImage" => 50,
+        _ => 1_000,
+    }
+}
+
+fn capture_node(el: &AxElement, depth: u32, max_depth: u32, ctx: &mut WalkCtx) -> Node {
     // One batched IPC for all 10 node attributes (the per-attribute path costs
     // 8–10 Mach round-trips per node — THE extraction-latency hot spot on big
     // trees). Name fallback priority is identical: Title → Description → Label
     // → Value. Falls back to the per-attribute path when the batch call fails
     // outright (dying element, app without the multi-attribute API).
-    let (role, subrole, name, identifier, value, role_description, bounds) =
+    let (role, subrole, name, identifier, mut value, role_description, bounds, state, min_value, max_value) =
         match el.batch_node_attrs() {
             Some(a) => {
                 let name = a
@@ -915,6 +1237,19 @@ fn capture_node(el: &AxElement, depth: u32, max_depth: u32) -> Node {
                     (Some(pt), Some((w, h))) => Some(ScreenRect { x: pt.x, y: pt.y, w, h }),
                     _ => None,
                 };
+                let mut state: Vec<String> = Vec::new();
+                if a.focused == Some(true) {
+                    state.push("focused".into());
+                }
+                if a.selected == Some(true) {
+                    state.push("selected".into());
+                }
+                if a.expanded == Some(true) {
+                    state.push("expanded".into());
+                }
+                if a.enabled == Some(false) {
+                    state.push("disabled".into());
+                }
                 (
                     a.role.unwrap_or_else(|| "AXUnknown".into()),
                     a.subrole.filter(|s| !s.is_empty()),
@@ -923,6 +1258,9 @@ fn capture_node(el: &AxElement, depth: u32, max_depth: u32) -> Node {
                     value,
                     a.role_description.filter(|s| !s.is_empty()),
                     bounds,
+                    state,
+                    a.min_value,
+                    a.max_value,
                 )
             }
             None => {
@@ -941,17 +1279,46 @@ fn capture_node(el: &AxElement, depth: u32, max_depth: u32) -> Node {
                 let role_description = el
                     .str_attr("AXRoleDescription")
                     .filter(|s| !s.is_empty());
-                (role, subrole, name, identifier, value, role_description, el.rect())
+                (role, subrole, name, identifier, value, role_description, el.rect(), Vec::new(), None, None)
             }
         };
 
+    // Two-state roles report a numeric AXValue — translate to the words the
+    // generator actually needs ("is this checkbox on?") instead of a bare "1".
+    if matches!(
+        role.as_str(),
+        "AXCheckBox" | "AXRadioButton" | "AXToggleButton" | "AXDisclosureTriangle"
+    ) {
+        value = match value.as_deref() {
+            Some("0") => Some("off".into()),
+            Some("1") => Some("on".into()),
+            Some("2") => Some("mixed".into()),
+            other => other.map(|s| s.to_string()),
+        };
+    }
+
     let mut children = Vec::new();
     let mut child_source: Option<String> = None;
+    let mut truncated = false;
     if depth < max_depth {
-        let (kids, rel) = enumerate_children(el);
-        child_source = rel.map(|r| r.to_string());
-        for kid in &kids {
-            children.push(capture_node(kid, depth + 1, max_depth));
+        let (kids, rel) = enumerate_children(el, &role);
+        child_source = rel;
+        let cap = child_cap(&role);
+        if kids.len() > cap {
+            truncated = true;
+        }
+        for kid in kids.iter().take(cap) {
+            if ctx.nodes_left == 0 {
+                truncated = true;
+                break;
+            }
+            // Emit each element once — relations alias (a row can appear under
+            // both AXChildren and AXRows) and broken trees can cycle.
+            if !ctx.visited.insert(kid.id_hash()) {
+                continue;
+            }
+            ctx.nodes_left -= 1;
+            children.push(capture_node(kid, depth + 1, max_depth, ctx));
         }
     }
     // Honesty marker: a web surface that exposed NO children through ANY
@@ -972,34 +1339,84 @@ fn capture_node(el: &AxElement, depth: u32, max_depth: u32) -> Node {
         role_description,
         bounds,
         bg: None,
+        state,
+        min_value,
+        max_value,
+        truncated,
         child_source,
         children,
     }
 }
 
-/// Enumerate an element's child elements, trying the standard relations first
-/// and then the less-common ones some apps hide structure behind. Returns the
-/// children plus the relation name when it WASN'T the obvious AXChildren /
-/// AXVisibleChildren (so `capture_node` can record where structure came from).
+/// Enumerate an element's child elements: the standard relations first, then
+/// the role-specific ones apps hide structure behind, MERGED and deduped by
+/// element identity. Returns the children plus a relation note when structure
+/// came from anywhere beyond the obvious AXChildren / AXVisibleChildren (so
+/// `capture_node` can record where it came from).
 ///
-/// Stops at the first non-empty relation — rows/contents are frequently ALSO
-/// listed under AXChildren, so merging would double-count. The fallbacks
-/// (AXContents = scroll areas; AXRows = tables/outlines/lists; AXSections =
-/// web/structured documents) are why a previously-flat extraction now descends
-/// into tables and scroll containers instead of stopping at the container.
-fn enumerate_children(el: &AxElement) -> (Vec<AxElement>, Option<&'static str>) {
+/// Why merge instead of first-non-empty: an AXWindow exposes its content via
+/// AXChildren AND a modal sheet only via AXSheets; a table can list columns
+/// under AXChildren while the rows live only under AXRows. First-wins dropped
+/// those — tables lost cells, tab groups lost tabs, windows lost sheets.
+/// Dedup by `id_hash` keeps the aliased majority from double-counting.
+///
+/// Inner slices are ALTERNATIVES tried in order (first that contributes wins)
+/// so AXVisibleRows is preferred over the potentially huge full AXRows.
+fn enumerate_children(el: &AxElement, role: &str) -> (Vec<AxElement>, Option<String>) {
     let visible = el.array_attr("AXVisibleChildren");
-    if !visible.is_empty() {
-        return (visible, None);
+    let mut kids = if !visible.is_empty() {
+        visible
+    } else {
+        el.array_attr("AXChildren")
+    };
+
+    let extra: &[&[&str]] = match role {
+        "AXWindow" => &[&["AXSheets"]],
+        "AXTabGroup" => &[&["AXTabs"]],
+        "AXSplitGroup" => &[&["AXSplitters"], &["AXContents"]],
+        "AXTable" | "AXOutline" | "AXGrid" | "AXBrowser" | "AXList" => {
+            &[&["AXVisibleRows", "AXRows"]]
+        }
+        "AXRow" => &[&["AXVisibleCells", "AXCells"]],
+        _ => &[],
+    };
+
+    let mut sources: Vec<&'static str> = Vec::new();
+    if !extra.is_empty() {
+        let mut seen: std::collections::HashSet<usize> =
+            kids.iter().map(|k| k.id_hash()).collect();
+        for alternatives in extra {
+            for rel in *alternatives {
+                let mut contributed = false;
+                for k in el.array_attr(rel) {
+                    if seen.insert(k.id_hash()) {
+                        kids.push(k);
+                        contributed = true;
+                    }
+                }
+                if contributed {
+                    sources.push(rel);
+                    break; // this alternative produced structure; skip the rest
+                }
+            }
+        }
     }
-    let children = el.array_attr("AXChildren");
-    if !children.is_empty() {
-        return (children, None);
+
+    if !kids.is_empty() {
+        let source = if sources.is_empty() {
+            None
+        } else {
+            Some(format!("AXChildren+{}", sources.join("+")))
+        };
+        return (kids, source);
     }
+
+    // Last-ditch relations some apps use INSTEAD of children entirely
+    // (AXContents = scroll areas; AXRows = tables; AXSections = documents).
     for rel in ["AXContents", "AXRows", "AXSections"] {
-        let kids = el.array_attr(rel);
-        if !kids.is_empty() {
-            return (kids, Some(rel));
+        let fallback = el.array_attr(rel);
+        if !fallback.is_empty() {
+            return (fallback, Some(rel.to_string()));
         }
     }
     (Vec::new(), None)
@@ -1096,6 +1513,7 @@ fn app_element(pid: i32) -> Result<AxElement> {
 /// Walk the entire AX tree of an application from its root, to `max_depth`.
 /// Wakes the app's AX tree first (idempotent; needed for Electron).
 pub fn walk_app(pid: i32, max_depth: u32) -> Result<Node> {
+    set_ax_messaging_timeout();
     if !check_permission(false) {
         bail!("AX permission denied — grant Accessibility access in System Settings then retry.");
     }
@@ -1106,6 +1524,7 @@ pub fn walk_app(pid: i32, max_depth: u32) -> Result<Node> {
 
 /// Walk a single window of an application, selected by [`WindowSelector`].
 pub fn walk_window(pid: i32, sel: WindowSelector, max_depth: u32) -> Result<Node> {
+    set_ax_messaging_timeout();
     if !check_permission(false) {
         bail!("AX permission denied — grant Accessibility access in System Settings then retry.");
     }

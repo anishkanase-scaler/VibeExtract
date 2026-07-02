@@ -84,3 +84,17 @@ print(f"built plugin marketplace at {out_mkt}")
 print(f"  plugin: {PLUGIN_NAME}@{MARKETPLACE} v{VERSION}")
 print(f"  skills: {', '.join(SKILL_SRC)}")
 print(f"  mcp:    vibe-extract (http://127.0.0.1:8765/mcp), playwright")
+
+# Keep the repo-local dev copy (.claude/skills/<skill>) in sync with canonical,
+# so editing canonical + running this script updates ALL three copies — the
+# .claude copy was hand-synced before and drifted.
+repo_root = os.path.dirname(os.path.dirname(HERE))
+dev_skills = os.path.join(repo_root, ".claude", "skills")
+if os.path.isdir(dev_skills):
+    for name, src in SKILL_SRC.items():
+        dst = os.path.join(dev_skills, name)
+        if os.path.isdir(src):
+            if os.path.isdir(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst, ignore=_ignore)
+    print(f"  dev:    synced {', '.join(SKILL_SRC)} -> {dev_skills}")

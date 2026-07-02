@@ -1154,7 +1154,7 @@ async fn capture_pick_crop(app: &AppHandle, picked: &mut PickedElement) {
 
 /// Depth cap for the pick-time AX subtree walk — matches the live `ax_subtree_at_point`
 /// default and the dispatcher's window walk.
-const PICK_AX_MAX_DEPTH: u32 = 12;
+const PICK_AX_MAX_DEPTH: u32 = 25;
 /// Node cap so a pathological tree can't bloat `last-selection.json` / RAM. On overflow
 /// we drop the tree (leave `None`) rather than ship a truncated, misleading structure.
 #[cfg(target_os = "macos")]
@@ -2164,6 +2164,10 @@ async fn walk_hover_ancestry(app: AppHandle, go_up: bool) -> Result<(), String> 
                     role_description: Some("group".into()),
                     bounds: Some(band),
                     bg: None,
+                    state: Vec::new(),
+                    min_value: None,
+                    max_value: None,
+                    truncated: false,
                     child_source: Some("AXSiblingBand".into()),
                     children: kids,
                 });

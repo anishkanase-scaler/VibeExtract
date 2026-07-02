@@ -127,16 +127,28 @@ fn emit_toon_node(node: &Node, indent: u32, out: &mut String) {
             format!(" value=\"{}\"", truncated.replace('"', "\\\""))
         })
         .unwrap_or_default();
+    let state_str = if node.state.is_empty() {
+        String::new()
+    } else {
+        format!(" state=[{}]", node.state.join(","))
+    };
+    let range_str = match (node.min_value, node.max_value) {
+        (Some(lo), Some(hi)) => format!(" range=[{lo},{hi}]"),
+        _ => String::new(),
+    };
+    let trunc_str = if node.truncated { " ⚠truncated" } else { "" };
 
     if node.children.is_empty() {
         out.push_str(&format!(
-            "{}{}{}{}{}{}{}{}\n",
-            pad, role, name_str, value_str, bounds_str, bg_str, id_str, role_desc
+            "{}{}{}{}{}{}{}{}{}{}{}\n",
+            pad, role, name_str, value_str, state_str, range_str, bounds_str, bg_str, id_str,
+            role_desc, trunc_str
         ));
     } else {
         out.push_str(&format!(
-            "{}{}{}{}{}{}{}{} {{\n",
-            pad, role, name_str, value_str, bounds_str, bg_str, id_str, role_desc
+            "{}{}{}{}{}{}{}{}{}{}{} {{\n",
+            pad, role, name_str, value_str, state_str, range_str, bounds_str, bg_str, id_str,
+            role_desc, trunc_str
         ));
         for kid in &node.children {
             emit_toon_node(kid, indent + 1, out);
@@ -255,11 +267,24 @@ fn render_dom(node: &Node, root_bounds: ScreenRect, out: &mut String, depth: u32
             String::new()
         };
 
+        // UI state: carried as a data attribute so consumers can restyle, and
+        // disabled controls render dimmed the way the source app shows them.
+        let state_attr = if node.state.is_empty() {
+            String::new()
+        } else {
+            format!(" data-state=\"{}\"", node.state.join(" "))
+        };
+        let disabled_style = if node.state.iter().any(|s| s == "disabled") {
+            " opacity: 0.45;"
+        } else {
+            ""
+        };
+
         let pad = "  ".repeat(depth as usize + 3);
         let style = format!(
-            "left:{lx:.0}px; top:{ly:.0}px; width:{w:.0}px; height:{h:.0}px;{bg}{color}{font}",
+            "left:{lx:.0}px; top:{ly:.0}px; width:{w:.0}px; height:{h:.0}px;{bg}{color}{font}{dis}",
             lx = lx, ly = ly, w = b.w, h = b.h,
-            bg = bg_style, color = color_style, font = font_style
+            bg = bg_style, color = color_style, font = font_style, dis = disabled_style
         );
 
         // For containers, recurse into children INSIDE the parent tag.
@@ -273,9 +298,9 @@ fn render_dom(node: &Node, root_bounds: ScreenRect, out: &mut String, depth: u32
 
         if is_container && !node.children.is_empty() {
             out.push_str(&format!(
-                "{pad}<{tag} class=\"ve-el {class}\" data-role=\"{role}\" style=\"{style}\">\n",
+                "{pad}<{tag} class=\"ve-el {class}\" data-role=\"{role}\"{state} style=\"{style}\">\n",
                 pad = pad, tag = tag, class = class,
-                role = html_escape(&node.role), style = style
+                role = html_escape(&node.role), state = state_attr, style = style
             ));
             // Children — recursive emit. NOTE: child positions are still
             // RELATIVE TO THE ROOT (not the parent), because AX bounds are
@@ -291,21 +316,21 @@ fn render_dom(node: &Node, root_bounds: ScreenRect, out: &mut String, depth: u32
             // Leaf or empty container — single tag with text content inline.
             if tag == "img" {
                 out.push_str(&format!(
-                    "{pad}<img class=\"ve-el ve-image\" data-role=\"{role}\" alt=\"{alt}\" style=\"{style}\">\n",
-                    pad = pad, role = html_escape(&node.role),
+                    "{pad}<img class=\"ve-el ve-image\" data-role=\"{role}\"{state} alt=\"{alt}\" style=\"{style}\">\n",
+                    pad = pad, role = html_escape(&node.role), state = state_attr,
                     alt = inner_text, style = style
                 ));
             } else if tag == "input" {
                 out.push_str(&format!(
-                    "{pad}<input class=\"ve-el {class}\" data-role=\"{role}\" value=\"{val}\" style=\"{style}\">\n",
-                    pad = pad, class = class, role = html_escape(&node.role),
+                    "{pad}<input class=\"ve-el {class}\" data-role=\"{role}\"{state} value=\"{val}\" style=\"{style}\">\n",
+                    pad = pad, class = class, role = html_escape(&node.role), state = state_attr,
                     val = inner_text, style = style
                 ));
             } else {
                 out.push_str(&format!(
-                    "{pad}<{tag} class=\"ve-el {class}\" data-role=\"{role}\" style=\"{style}\">{text}</{tag}>\n",
+                    "{pad}<{tag} class=\"ve-el {class}\" data-role=\"{role}\"{state} style=\"{style}\">{text}</{tag}>\n",
                     pad = pad, tag = tag, class = class,
-                    role = html_escape(&node.role), style = style,
+                    role = html_escape(&node.role), state = state_attr, style = style,
                     text = inner_text
                 ));
             }
@@ -393,6 +418,10 @@ mod tests {
             role_description: None,
             bounds: Some(ScreenRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }),
             bg: None,
+            state: Vec::new(),
+            min_value: None,
+            max_value: None,
+            truncated: false,
             child_source: None,
             children,
         }
@@ -543,5 +572,35 @@ mod tests {
             !out.contains("toggle-ref") && !out.contains("show-ref"),
             "old toggle-ref / show-ref class names must be gone (renamed to toggle-ax / show-ax). Got:\n{}", out
         );
+    }
+
+    #[test]
+    fn toon_emits_state_range_and_truncation() {
+        let mut leaf = make_node("AXSlider", vec![]);
+        leaf.state = vec!["focused".into(), "disabled".into()];
+        leaf.min_value = Some(0.0);
+        leaf.max_value = Some(100.0);
+        leaf.value = Some("40".into());
+        leaf.truncated = true;
+        let root = make_node("AXGroup", vec![leaf]);
+        let picked = make_picked("AXGroup", 100.0, 100.0);
+        let out = emit_toon(&root, &[], &picked, None);
+        assert!(out.contains("state=[focused,disabled]"), "state flags must reach TOON. Got:\n{out}");
+        assert!(out.contains("range=[0,100]"), "slider range must reach TOON. Got:\n{out}");
+        assert!(out.contains("⚠truncated"), "truncation must be visible in TOON. Got:\n{out}");
+    }
+
+    #[test]
+    fn html_disabled_state_dims_and_tags_element() {
+        let mut btn = make_node("AXButton", vec![]);
+        btn.state = vec!["disabled".into()];
+        let root = make_node("AXGroup", vec![btn]);
+        let picked = make_picked("AXGroup", 100.0, 100.0);
+        let out = emit_html(&root, "B64", picked.bounds);
+        assert!(
+            out.contains(r#"data-state="disabled""#),
+            "state must be carried as a data attribute. Got:\n{out}"
+        );
+        assert!(out.contains("opacity: 0.45;"), "disabled controls must render dimmed. Got:\n{out}");
     }
 }

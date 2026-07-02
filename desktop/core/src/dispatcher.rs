@@ -642,7 +642,10 @@ async fn native_extract_macos(
     // The walk is IPC-bound (one Mach round-trip per attribute batch) and the
     // AXUIElement is non-Send, so it stays on this thread while the
     // screencapture child runs concurrently as its own process.
-    let mut node = crate::ax_macos::walk_node(&root_el, 12);
+    // Depth 25 (was 12): deep native trees (outline views, nested split
+    // groups) were getting cut off mid-structure. The walk's node budget and
+    // per-role child caps keep pathological trees bounded instead of depth.
+    let mut node = crate::ax_macos::walk_node(&root_el, 25);
     t.lap("walk");
 
     pending_shot.wait()?; // usually 0ms — finished while we walked the tree

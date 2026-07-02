@@ -269,7 +269,11 @@ async fn extract_at_viewport_inner(
     // failure just leaves ax_tree None and the export (html/toon) still stands.
     // Bounds are viewport-relative CSS px (== points); a consumer that needs
     // screen-space offsets by the web-content origin (see `dom_tree_at`).
-    let ax_tree = fetch_dom_tree(&mut socket, &mut next_id, viewport_x, viewport_y, 12, 600)
+    // Depth 20 / 1500 nodes (was 12/600): big Electron components (Slack
+    // threads, Notion pages) blew the old budget and silently lost their deep
+    // children. The walker now also marks the node where a budget ran out
+    // (`truncated`) so an incomplete tree is visible instead of silent.
+    let ax_tree = fetch_dom_tree(&mut socket, &mut next_id, viewport_x, viewport_y, 20, 1500)
         .await
         .ok()
         .flatten()
@@ -438,6 +442,8 @@ struct DomNode {
     w: f64,
     h: f64,
     #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
     children: Vec<DomNode>,
 }
 
@@ -497,9 +503,9 @@ const DOM_TREE_JS: &str = r#"(function(){
           if(t==='script'||t==='style'||t==='meta'||t==='link'||t==='noscript') continue;
           var ch=walk(c,depth+1);
           if(ch) node.children.push(ch);
-          if(count>=BUDGET) break;
+          if(count>=BUDGET){node.truncated=true;break;}
         }
-      }
+      }else if(el.firstElementChild){node.truncated=true;}
       return node;
     }
     return walk(expand(start),0);
@@ -525,6 +531,10 @@ fn dom_to_node(d: DomNode, ox: f64, oy: f64) -> crate::ax_macos::Node {
             h: d.h,
         }),
         bg: None,
+        state: Vec::new(),
+        min_value: None,
+        max_value: None,
+        truncated: d.truncated,
         child_source: Some("CDP-DOM".into()),
         children: d
             .children

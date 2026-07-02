@@ -172,13 +172,13 @@ impl VibeExtractMcp {
     }
 
     #[tool(
-        description = "Walk the macOS Accessibility tree of an app from its root (or a single window via window_index). Returns roles, names, values, per-element bounds (points), and children. The component inventory for replication. max_depth defaults to 12."
+        description = "Walk the macOS Accessibility tree of an app from its root (or a single window via window_index). Returns roles, names, values, per-element bounds (points), and children. The component inventory for replication. max_depth defaults to 25."
     )]
     async fn ax_tree(
         &self,
         Parameters(p): Parameters<AxTreeParam>,
     ) -> Result<CallToolResult, ErrorData> {
-        let depth = p.max_depth.unwrap_or(12);
+        let depth = p.max_depth.unwrap_or(25);
         match ax_bridge::ax_tree(p.pid, depth, p.window_index).await {
             Ok(v) => ok_value(v),
             Err(e) => tool_err(e),
@@ -198,12 +198,12 @@ impl VibeExtractMcp {
         }
     }
 
-    #[tool(description = "Walk the AX subtree rooted at the deepest element under a screen point. max_depth defaults to 12.")]
+    #[tool(description = "Walk the AX subtree rooted at the deepest element under a screen point. max_depth defaults to 25.")]
     async fn ax_subtree_at_point(
         &self,
         Parameters(p): Parameters<SubtreeParam>,
     ) -> Result<CallToolResult, ErrorData> {
-        let depth = p.max_depth.unwrap_or(12);
+        let depth = p.max_depth.unwrap_or(25);
         match ax_bridge::subtree_at_point(p.x, p.y, depth).await {
             Ok(v) => ok_value(v),
             Err(e) => tool_err(e),
@@ -272,12 +272,12 @@ impl VibeExtractMcp {
         }
     }
 
-    #[tool(description = "Sample a deduped color palette from an app's main window (AX node centers). max_depth defaults to 12.")]
+    #[tool(description = "Sample a deduped color palette from an app's main window (AX node centers). max_depth defaults to 25.")]
     async fn color_palette(
         &self,
         Parameters(p): Parameters<PaletteParam>,
     ) -> Result<CallToolResult, ErrorData> {
-        match ax_bridge::palette(p.pid, p.max_depth.unwrap_or(12)).await {
+        match ax_bridge::palette(p.pid, p.max_depth.unwrap_or(25)).await {
             Ok(v) => ok_value(v),
             Err(e) => tool_err(e),
         }

@@ -37,11 +37,20 @@ import icon_match as im
 
 
 def run_gate(native_path, replica_path, boxes, out="_icon_gate.png",
-             color_max=50, shape_pass=0.45, loc_min=0.20, search=(60, 28)):
-    """Returns (results, code). results = [{name, verdict, shape, loc, body_delta, accent_delta}].
-    code: 0 all PASS, 1 any FAIL, 2 some EYEBALL (no FAIL)."""
+             color_max=50, shape_pass=0.45, loc_min=0.20, search=(60, 28),
+             lock_map=None):
+    """Returns (results, code). results = [{name, verdict, shape, loc, body_delta, accent_delta, lock}].
+    code: 0 all PASS, 1 any FAIL, 2 some EYEBALL (no FAIL).
+
+    lock_map: path to icon_map.json. When given, every PASS icon that has a
+    resource entry there gets its lock written/refreshed via
+    `icon_match.confirm_pick` with THIS run's located native crop — the gate is
+    the one place that both verifies an icon and holds the verified pixels, so
+    it is where crop_hash gets recorded (prose instructions to do this manually
+    never happened, which is why legacy maps have no hashes)."""
     nat = Image.open(native_path).convert("RGB")
     rep = Image.open(replica_path).convert("RGB")
+    locks = im.load_map(lock_map) if lock_map else {}
     results, tiles = [], []
     for name, box in boxes.items():
         g, nc, rc = im.gate_at(nat, rep, tuple(box), search=search, color_max=color_max)
@@ -63,8 +72,24 @@ def run_gate(native_path, replica_path, boxes, out="_icon_gate.png",
             verdict = "PASS"
         else:
             verdict = "EYEBALL"   # located + colour-clean but low shape (thin/complex glyph) → LOOK
+        lock_state = "-"
+        if lock_map:
+            entry = locks.get(name)
+            if verdict == "PASS" and entry and entry.get("resource"):
+                im.confirm_pick(lock_map, name, entry["resource"], nc,
+                                gate={"verdict": verdict, "shape": g["shape"], "loc": g["loc"],
+                                      "body_delta": g["body_delta"], "accent_delta": g["accent_delta"]})
+                lock_state = "LOCKED"
+            elif entry and entry.get("confirmed"):
+                # confirmed but not gate-PASSED this run — the lock stays but is
+                # NOT refreshed; an EYEBALL confirmed by eye must be locked
+                # explicitly via icon_match.confirm_pick.
+                lock_state = "stale"
+            else:
+                lock_state = "unlocked"
         results.append({"name": name, "verdict": verdict, "shape": g["shape"], "loc": g["loc"],
-                        "body_delta": g["body_delta"], "accent_delta": g["accent_delta"]})
+                        "body_delta": g["body_delta"], "accent_delta": g["accent_delta"],
+                        "lock": lock_state})
         # native | replica tile for the contact sheet
         w = max(nc.width, rc.width)
         t = Image.new("RGB", (2 * w + 6, max(nc.height, rc.height)), "#202020")
@@ -102,16 +127,31 @@ def main():
     ap.add_argument("--shape-pass", type=float, default=0.45)
     ap.add_argument("--loc-min", type=float, default=0.20)
     ap.add_argument("--search", default="60x28")
+    ap.add_argument("--update-locks", metavar="ICON_MAP",
+                    help="icon_map.json — every PASS icon gets its lock written/refreshed "
+                         "(records crop_hash of this run's located native crop)")
+    ap.add_argument("--only", metavar="NAMES",
+                    help="comma-separated icon names — gate just this subset (pages 2+ reverify)")
     a = ap.parse_args()
     sx, sy = (int(v) for v in a.search.lower().split("x"))
     boxes = json.load(open(a.boxes))
+    if a.only:
+        keep = {n.strip() for n in a.only.split(",") if n.strip()}
+        missing = keep - set(boxes)
+        if missing:
+            print(f"WARNING: --only names not in {a.boxes}: {sorted(missing)}", file=sys.stderr)
+        boxes = {n: b for n, b in boxes.items() if n in keep}
+        if not boxes:
+            print("ERROR: --only filtered every icon out; nothing to gate", file=sys.stderr)
+            sys.exit(1)
     results, code = run_gate(a.native, a.replica, boxes, out=a.out, color_max=a.color_max,
-                             shape_pass=a.shape_pass, loc_min=a.loc_min, search=(sx, sy))
-    print(f"{'icon':14s} {'verdict':8s} {'shape':>6s} {'loc':>5s} {'bodyΔ':>6s} {'accΔ':>5s}")
+                             shape_pass=a.shape_pass, loc_min=a.loc_min, search=(sx, sy),
+                             lock_map=a.update_locks)
+    print(f"{'icon':14s} {'verdict':8s} {'shape':>6s} {'loc':>5s} {'bodyΔ':>6s} {'accΔ':>5s} {'lock':>8s}")
     for r in results:
         acc = "-" if r["accent_delta"] is None else r["accent_delta"]
         print(f"{r['name']:14s} {r['verdict']:8s} {r['shape']:6.3f} {r['loc']:5.2f} "
-              f"{r['body_delta']:6d} {str(acc):>5s}")
+              f"{r['body_delta']:6d} {str(acc):>5s} {r.get('lock', '-'):>8s}")
     n = len(results)
     npass = sum(r["verdict"] == "PASS" for r in results)
     fails = [r["name"] for r in results if r["verdict"] == "FAIL"]

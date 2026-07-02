@@ -317,9 +317,57 @@ def save_map(path, m):
     json.dump(m, open(path, "w"), indent=2, sort_keys=True)
 
 
-def crop_hash(crop_bytes):
-    return hashlib.sha1(crop_bytes).hexdigest()[:16]
+def crop_hash(src):
+    """SHA1[:16] of a verified native crop. Accepts raw bytes, a file path, or a
+    PIL Image (re-encoded to PNG so callers don't have to round-trip a file)."""
+    if isinstance(src, bytes):
+        data = src
+    elif isinstance(src, str):
+        data = open(src, "rb").read()
+    else:
+        import io
+        buf = io.BytesIO()
+        src.convert("RGB").save(buf, "PNG")
+        data = buf.getvalue()
+    return hashlib.sha1(data).hexdigest()[:16]
 
 
 def is_locked(entry, ch):
     return bool(entry) and entry.get("confirmed") and entry.get("crop_hash") == ch
+
+
+def confirm_pick(map_path, name, resource, native_crop, gate=None):
+    """The ONLY sanctioned way to write a lock. Historically generators
+    `json.dump`ed over icon_map.json without ever recording `crop_hash`, so
+    `is_locked` was always False and 'locked' icons silently re-picked on the
+    next page. This MERGES (never clobbers other entries) and records the hash
+    of the native crop the pick was verified against — making the lock real."""
+    m = load_map(map_path)
+    entry = {"resource": resource, "confirmed": True, "crop_hash": crop_hash(native_crop)}
+    if gate:
+        entry["gate"] = {k: gate[k] for k in ("verdict", "shape", "loc", "body_delta", "accent_delta")
+                         if k in gate}
+    m[name] = entry
+    save_map(map_path, m)
+    return entry
+
+
+def lock_decision(entry, fresh_ch, pool_idx=None):
+    """Re-pick policy for a control on a LATER page/run, given its icon_map
+    entry and the crop_hash of THIS page's fresh native crop. Returns:
+      'reuse'    — confirmed and the fresh crop is byte-identical to the one
+                   the lock was verified against: place it, zero cost.
+      'reverify' — confirmed but the capture differs (the normal cross-page
+                   case, and all legacy entries without crop_hash): place the
+                   locked resource, then it MUST pass icon_gate against THIS
+                   page's capture before it counts as done. Never reuse on faith.
+      'repick'   — no confirmed entry, or the locked resource no longer exists
+                   in the fresh pool (app updated): run the full match pipeline.
+    """
+    if not entry or not entry.get("confirmed") or not entry.get("resource"):
+        return "repick"
+    if pool_idx is not None and entry["resource"] not in pool_idx:
+        return "repick"
+    if entry.get("crop_hash") and entry["crop_hash"] == fresh_ch:
+        return "reuse"
+    return "reverify"

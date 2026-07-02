@@ -12,7 +12,13 @@ returns a uniform pool that `icon_match` can rasterise + score:
 
 Pure stdlib (struct/zlib/glob/os) + the existing native_icons helpers. No third-party deps.
 """
-import os, struct, zlib, glob, json
+import os, struct, zlib, glob, json, sys, hashlib
+
+
+def _warn(msg):
+    """Extraction failures must be VISIBLE: a silently shrunken pool degrades
+    icon matching with no clue why (the old bare `except: pass` did exactly that)."""
+    print(f"resource_extract WARNING: {msg}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- Qt .rcc (qres)
@@ -67,8 +73,8 @@ def _pool_qt(app_path, active_skin=None):
             for k, v in parse_rcc(r).items():
                 if k.endswith((".svg", ".png")):
                     pool[k] = v          # later (skin/bigger) wins
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"failed to parse {r}: {e}")
     return pool
 
 
@@ -103,36 +109,131 @@ def _detect_kind(app_path):
     return "loose"
 
 
-def extract_pool(app_path, kind=None, out_dir=None):
+def extract_pool(app_path, kind=None, out_dir=None, cache_dir=None):
     """Flat {resource_key: bytes} of ALL candidate icons for the app.
 
     `kind` auto-detected from the bundle unless forced. `out_dir` is the replica working
     dir (needed for electron's harvested manifest). Keys are the resource path (qt/loose)
     or `/<name>.svg` (electron) — unique; use `basename()` to map a name-prior to candidates.
+
+    `cache_dir` (e.g. "pool"): persist the extracted pool there, keyed by an app
+    fingerprint (bundle path + version + resource mtimes). On pages 2+ of the
+    SAME app the extraction — the slowest harvest step — is skipped entirely
+    when the fingerprint still matches; any change to the app bundle invalidates
+    the cache and re-extracts. Safe by construction: the pool comes from the app
+    BUNDLE, never from a previous page's screenshots. Electron pools are always
+    harvested fresh (their icons come from the live DOM, not the bundle).
     """
     kind = kind or _detect_kind(app_path)
-    if kind == "qt":
-        return _pool_qt(app_path)
-    if kind == "appkit":
-        return _pool_appkit(app_path)
     if kind == "electron":
         return _pool_electron(out_dir or ".")
-    return _pool_loose(app_path)
+    if cache_dir:
+        cached = cached_pool(app_path, cache_dir)
+        if cached is not None:
+            print(f"resource_extract: pool cache HIT ({len(cached)} icons; bundle unchanged) — "
+                  f"skipping re-extraction", file=sys.stderr)
+            return cached
+    if kind == "qt":
+        pool = _pool_qt(app_path)
+    elif kind == "appkit":
+        pool = _pool_appkit(app_path)
+    else:
+        pool = _pool_loose(app_path)
+    if cache_dir and pool:
+        save_pool(pool, app_path, cache_dir)
+    return pool
+
+
+# ---------------------------------------------------------------- pool cache (pages 2+)
+def fingerprint_app(app_path):
+    """Validity key for a cached pool: bundle path + CFBundleShortVersionString +
+    newest mtime over Info.plist / *.rcc / Assets.car. Cheap (a handful of stats),
+    and any app update or theme-bundle swap changes it."""
+    base = app_path if app_path.endswith("Contents") else os.path.join(app_path, "Contents")
+    info = os.path.join(base, "Info.plist")
+    version = None
+    try:
+        import plistlib
+        with open(info, "rb") as f:
+            version = plistlib.load(f).get("CFBundleShortVersionString")
+    except Exception:
+        pass
+    newest = 0.0
+    paths = [info]
+    for pat in ("*.rcc", "Assets.car"):
+        paths += glob.glob(os.path.join(base, "Resources", "**", pat), recursive=True)
+    for p in paths:
+        try:
+            newest = max(newest, os.path.getmtime(p))
+        except OSError:
+            pass
+    return {"app": os.path.abspath(app_path), "version": version, "newest_mtime": round(newest, 3)}
+
+
+def save_pool(pool, app_path, cache_dir):
+    """Persist {key: bytes} under `cache_dir`, content-addressed, with a manifest
+    recording the app fingerprint that makes the cache valid."""
+    os.makedirs(cache_dir, exist_ok=True)
+    files = {}
+    for key, data in pool.items():
+        ext = os.path.splitext(key)[1] or ".bin"
+        rel = hashlib.sha1(data).hexdigest()[:16] + ext
+        p = os.path.join(cache_dir, rel)
+        if not os.path.exists(p):
+            with open(p, "wb") as f:
+                f.write(data)
+        files[key] = rel
+    with open(os.path.join(cache_dir, "manifest.json"), "w") as f:
+        json.dump({"fingerprint": fingerprint_app(app_path), "files": files}, f, indent=1)
+
+
+def cached_pool(app_path, cache_dir):
+    """Load the pool persisted by `save_pool` — only if the app fingerprint still
+    matches AND every file is present. Anything off → None (full re-extract);
+    correctness is never traded for the cache hit."""
+    man = os.path.join(cache_dir, "manifest.json")
+    if not os.path.exists(man):
+        return None
+    try:
+        m = json.load(open(man))
+    except Exception:
+        return None
+    if m.get("fingerprint") != fingerprint_app(app_path):
+        return None
+    pool = {}
+    for key, rel in m.get("files", {}).items():
+        p = os.path.join(cache_dir, rel)
+        if not os.path.exists(p):
+            return None
+        pool[key] = open(p, "rb").read()
+    return pool or None
 
 
 def _pool_appkit(app_path):
     """Assets.car via the existing native_icons CoreUI extractor -> {base_name: png_bytes}."""
     import native_icons as ni
     pool = {}
-    for car in ni.find_catalogs(app_path):
+    cars = ni.find_catalogs(app_path)
+    if not cars:
+        _warn(f"no Assets.car found under {app_path}")
+    for car in cars:
         outdir = os.path.join(os.path.dirname(car), "_carpool")
+        if not os.access(os.path.dirname(car), os.W_OK):
+            # System apps / read-only bundles: extract into a user cache instead
+            # of silently losing the ENTIRE AppKit pool to a permission error.
+            tag = hashlib.sha1(car.encode()).hexdigest()[:12]
+            outdir = os.path.join(os.path.expanduser("~/.cache/vibe-extract/carpool"), tag)
         try:
             ni.build_pool(car, outdir)
+            n = 0
             for base, png in ni.load_pool(outdir, "normal_dark").items():
                 if os.path.exists(png):
                     pool["/" + base + ".png"] = open(png, "rb").read()
-        except Exception:
-            pass
+                    n += 1
+            if n == 0:
+                _warn(f"{car}: extractor produced no usable icons")
+        except Exception as e:
+            _warn(f"failed to extract {car}: {e}")
     return pool
 
 

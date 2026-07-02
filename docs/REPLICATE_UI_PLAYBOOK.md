@@ -309,6 +309,8 @@ It reports — and the skill **reuses** — three app-stable artifact classes pl
 | Artifact | Where | Why it's stable across pages | Reuse action |
 |---|---|---|---|
 | **Electron assets** (fonts, icon-svgs, images) | `assets/manifest.json` | Same app = same icon set + fonts | **Skip** `relaunch_with_debug_port` + `extract_assets` — the slowest, most disruptive step (it quits the app). Reference the existing `assets/` verbatim. |
+| **Bundle icon pool** (qt/appkit/loose apps) | `pool/manifest.json` | Icons come from the app BUNDLE, not screenshots | `extract_pool(app_path, cache_dir="pool")` fingerprints the bundle (path+version+mtimes) and **skips re-extraction** while it matches; any app update re-extracts. |
+| **Confirmed icon picks** | `icon_map.json` (`{resource,confirmed,crop_hash}`) | The same control uses the same resource | `icon_match.lock_decision` per control → `reuse` (capture identical) / `reverify` (gate the placed icon against THIS page's capture: `icon_gate.py … --only <list> --update-locks icon_map.json`) / `repick` (resource gone). Never reuse on faith. |
 | **Grid header labels** (A..Z / 1..N) | `capture/headers_cache.json` | Positionally fixed for a window size | `gridtext.py` reuses it automatically — no re-OCR. |
 | **Ribbon/toolbar sprites** (AX apps) | `cache/sprites/<hash>.png` | The toolbar doesn't change | Content-addressed (`SpriteCache`): an identical icon re-slices to a cache **hit**, sharing one file. |
 | **Prior verified replica** | `index.html` | A similar page is a small delta | **Start from it** — copy, then diff-edit only the changed regions and re-verify just those. |
