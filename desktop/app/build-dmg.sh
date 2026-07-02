@@ -58,12 +58,12 @@ codesign --verify --deep --strict "$APP" && echo "   signature valid ✓"
 echo "==> repackage .dmg from the signed app"
 VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo 0.0.0)
 ARCH=$(uname -m); [ "$ARCH" = "arm64" ] && ARCH="aarch64"
-OUTDMG="$BUNDLE_DIR/dmg/VibeExtract Desktop_${VER}_${ARCH}.dmg"
+OUTDMG="$BUNDLE_DIR/dmg/Echo Desktop_${VER}_${ARCH}.dmg"
 STAGE=$(mktemp -d)
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 mkdir -p "$BUNDLE_DIR/dmg"; rm -f "$OUTDMG"
-hdiutil create -volname "VibeExtract Desktop" -srcfolder "$STAGE" -ov -format UDZO "$OUTDMG" >/dev/null
+hdiutil create -volname "Echo Desktop" -srcfolder "$STAGE" -ov -format UDZO "$OUTDMG" >/dev/null
 rm -rf "$STAGE"
 codesign --force --sign "$IDENTITY_NAME" "$OUTDMG" 2>/dev/null || true
 
