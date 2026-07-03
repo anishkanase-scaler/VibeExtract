@@ -605,6 +605,14 @@
     @keyframes cardscan { 0%, 60% { top: -40px; } 90%, 100% { top: 110%; } }
     .pick-status .title { font-size: 14px; font-weight: 600; margin-bottom: 4px; position: relative; }
     .pick-status .sub { font-size: 12px; color: var(--text-muted); line-height: 1.55; position: relative; }
+    .pick-status .locked-list { margin-top: 10px; display: none; flex-direction: column; gap: 6px; position: relative; }
+    .pick-status .locked-list.show { display: flex; }
+    .locked-item { display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 6px 8px; }
+    .locked-item img { width: 48px; height: 34px; object-fit: cover; object-position: top left; border-radius: 5px; background: rgba(0,0,0,0.45); flex: none; }
+    .locked-item .li-ph { width: 48px; height: 34px; border-radius: 5px; background: rgba(255,255,255,0.06); display: flex; align-items: center; justify-content: center; font-size: 14px; color: var(--text-muted); flex: none; }
+    .locked-item .li-meta { min-width: 0; }
+    .locked-item .li-name { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .locked-item .li-sub { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .pick-status.active {
       background: linear-gradient(135deg, rgba(37,99,235,0.22), rgba(0,229,255,0.12));
       box-shadow:
@@ -1144,7 +1152,7 @@
       <div class="mark">
         <span class="mark-orbit"></span>
       </div>
-      <h1>Echo <span class="badge">Desktop</span></h1>
+      <h1>Echo <span class="badge">Desktop</span> <span class="badge" id="app-version"></span></h1>
     </div>
     <span class="badge" id="status">Ready</span>
   </header>
@@ -1152,6 +1160,11 @@
   <div id="perm-banner" class="perm-banner">
     <span>⚠️ Accessibility permission required to read other apps' UI trees.</span>
     <button id="open-settings">Open System Settings</button>
+  </div>
+
+  <div id="mcp-banner" class="perm-banner">
+    <span>⚠️ MCP server is off — Claude Code can't connect to Echo (/replicate-ui won't work).</span>
+    <button id="mcp-banner-start">Start MCP server</button>
   </div>
 
   <main>
@@ -1162,6 +1175,7 @@
           <div class="scanline"></div>
           <div class="title" id="pick-status-title">Idle</div>
           <div class="sub" id="pick-status-sub">Press <span class="key">⌘⇧S</span> to start picking</div>
+          <div class="locked-list" id="locked-list"></div>
         </div>
         <button id="export-btn" class="secondary" disabled>Export selection (⌘⇧E)</button>
         <p class="sub">Selection is <strong>hotkey-driven</strong> — on the app you want:
@@ -1185,16 +1199,6 @@
         <div class="row"><span>Last strategy</span><span class="v" id="last-capture">—</span></div>
         <div class="row click" id="output-row" title="Reveal in Finder">
           <span>Output folder</span><span class="v mono" id="output-dir">…</span>
-        </div>
-      </section>
-
-      <section>
-        <h2>Electron Apps</h2>
-        <div class="row" style="font-size: 11px; color: var(--text-muted); display: block; line-height: 1.4;">
-          When you ⌘⇧E on these, Echo can restart them in debug mode for pixel-perfect capture.
-        </div>
-        <div id="electron-apps-list" class="electron-apps-list">
-          <!-- Filled by JS -->
         </div>
       </section>
 
@@ -1248,7 +1252,8 @@
           Aim at any window on your Mac — Echo captures it and sets it free as living HTML.<br>
           <span class="dim">Press</span> <span class="key">⌘⇧S</span> <span class="dim">to begin ·</span>
           <span class="key">⇧</span>+<span class="key">Click</span> <span class="dim">multi-select ·</span>
-          <span class="key">⌘⇧E</span> <span class="dim">extract</span>
+          <span class="key">⌘⇧E</span> <span class="dim">extract</span><br>
+          <span class="dim">then in Claude Code:</span> <span class="key">/replicate-ui</span> <span class="dim">builds a pixel-verified replica</span>
         </div>
       </div>
 
@@ -1325,6 +1330,51 @@
     let lastResult = null;
     let targetApp = null;
 
+    // The locked-selection preview inside the Pick Mode card: one row per locked
+    // component — pick-time crop thumbnail (asset protocol) + name + role · W×H.
+    function renderLockedList(elements) {
+      const box = $('locked-list');
+      box.innerHTML = '';
+      const list = Array.isArray(elements) ? elements : [];
+      box.classList.toggle('show', list.length > 0);
+      const { convertFileSrc } = window.__TAURI__.core;
+      for (const el of list) {
+        const row = document.createElement('div');
+        row.className = 'locked-item';
+        if (el.crop_path) {
+          const img = document.createElement('img');
+          img.src = convertFileSrc(el.crop_path);
+          img.alt = '';
+          img.addEventListener('error', () => {
+            const ph = document.createElement('div');
+            ph.className = 'li-ph';
+            ph.textContent = '▣';
+            img.replaceWith(ph);
+          });
+          row.appendChild(img);
+        } else {
+          const ph = document.createElement('div');
+          ph.className = 'li-ph';
+          ph.textContent = '▣';
+          row.appendChild(ph);
+        }
+        const meta = document.createElement('div');
+        meta.className = 'li-meta';
+        const name = document.createElement('div');
+        name.className = 'li-name';
+        name.textContent = el.name || '(unnamed)';
+        name.title = el.name || '';
+        const sub = document.createElement('div');
+        sub.className = 'li-sub';
+        const b = el.bounds || {};
+        sub.textContent = `${el.role || '?'} · ${Math.round(b.w || 0)}×${Math.round(b.h || 0)}`;
+        meta.appendChild(name);
+        meta.appendChild(sub);
+        row.appendChild(meta);
+        box.appendChild(row);
+      }
+    }
+
     function refreshUI() {
       const ps = $('pick-status');
       const title = $('pick-status-title');
@@ -1335,9 +1385,11 @@
         title.innerHTML = `Picking…${targetStr} (${selectionCount} selected)`;
         sub.innerHTML = 'Hover + <span class="key">Click</span> to select · <span class="key">⇧</span>+Click add · <span class="key">⌘⇧E</span> extract · <span class="key">Esc</span> cancel.';
       } else {
-        title.textContent = selectionCount > 0 ? `${selectionCount} selected (paused)` : 'Idle';
+        title.textContent = selectionCount > 0
+          ? `✓ ${selectionCount} selected${targetApp ? ` from ${targetApp}` : ''}`
+          : 'Idle';
         sub.innerHTML = selectionCount > 0
-          ? 'Press <span class="key">⌘⇧E</span> to export, or <span class="key">⌘⇧S</span> to add more.'
+          ? 'Next: run <span class="key">/replicate-ui</span> in Claude Code · or <span class="key">⌘⇧E</span> to extract here · <span class="key">⌘⇧S</span> to add more.'
           : 'Go to any app, then press <span class="key">⌘⇧S</span> to start picking.';
       }
       $('export-btn').disabled = selectionCount === 0;
@@ -1359,6 +1411,10 @@
     $('open-settings').addEventListener('click', () => {
       invoke('request_ax_permission');
     });
+
+    // --- Build version in the header (confirms which build is running) -------
+    invoke('app_version').then((v) => { $('app-version').textContent = `v${v}`; })
+      .catch(() => { $('app-version').textContent = ''; });
 
     // --- Output folder (fetched from backend — never hardcoded) --------------
     invoke('output_dir_info').then((p) => {
@@ -1387,8 +1443,8 @@
       if (!lastResult) return;
       const tab = document.querySelector('.tab-btn.active')?.dataset.tab || 'html';
       const map = {
-        preview: ['HTML', lastResult.html],
-        html: ['HTML', lastResult.html],
+        preview: ['HTML', lastResult.htmlInline || lastResult.html],
+        html: ['HTML', lastResult.htmlInline || lastResult.html],
         toon: ['TOON', lastResult.toon],
         axtree: ['AX tree JSON', lastResult.ax_tree],
         diagnostics: ['diagnostics', (lastResult.diagnostics || []).join('\n')],
@@ -1406,13 +1462,26 @@
     // --- Backend events ------------------------------------------------------
     listen('pick-mode-changed', (event) => {
       pickActive = !!event.payload;
-      if (!pickActive) {
-        selectionCount = 0;
-        targetApp = null;
-      }
+      if (pickActive) renderLockedList([]); // fresh session — drop the old locked preview
+      // DON'T zero selectionCount/targetApp here — the selection survives pick
+      // mode ending (Enter locks it; the backend emits selection-count-changed 0
+      // itself on Esc/cancel). Zeroing here was why the app never showed
+      // "N selected from <app>" after a pick. (UX audit fix)
       refreshUI();
-      $('status').textContent = pickActive ? `Picking → ${targetApp || '?'}` : 'Ready';
+      $('status').textContent = pickActive
+        ? `Picking → ${targetApp || '?'}`
+        : (selectionCount > 0 ? `${selectionCount} selected — ready` : 'Ready');
       $('status').classList.toggle('active', pickActive);
+    });
+
+    // Enter pressed during pick → selection locked. Show WHAT locked (name/role/
+    // size + pick-time crop thumbnail) and tell the user what to do next.
+    listen('selection-committed', (event) => {
+      const list = Array.isArray(event.payload) ? event.payload : [];
+      if (list.length) selectionCount = list.length;
+      renderLockedList(list);
+      refreshUI();
+      toast('Selection locked ✓ — run /replicate-ui in Claude Code (or press ⌘⇧E to extract here)', { ms: 6500 });
     });
 
     listen('target-app', (event) => {
@@ -1424,6 +1493,7 @@
 
     listen('selection-count-changed', (event) => {
       selectionCount = event.payload || 0;
+      if (!selectionCount) renderLockedList([]); // selection cleared (Esc / post-export reset)
       refreshUI();
     });
 
@@ -1461,9 +1531,15 @@
       // HTML tab = the readable, indented DOM of the original source (relative paths,
       // no inlined base64). Preview iframe = the self-contained inlined html.
       const prettySource = prettyHtml(r.source || r.html || '');
-      const toon = axTreeToToon(r.ax_tree);
+      // TOON tab = compact outline of the HTML deliverable (not the AX tree).
+      const toon = htmlToToon(r.source || r.html);
       lastResult = { strategy: 'replica', fidelity: r.title || '', toon,
-        html: r.source || r.html || '', ax_tree: r.ax_tree || null,
+        html: r.source || r.html || '',
+        // Self-contained copy (assets inlined as data: URIs) — what Save/Copy
+        // emit so the exported .html renders standalone in a browser. The HTML
+        // *tab* still shows the readable relative-path source above.
+        htmlInline: r.html || r.source || '',
+        ax_tree: r.ax_tree || null,
         picked_summary: r.dir || '', count: 1 };
       $('empty-state').style.display = 'none';
       $('result-view').style.display = 'flex';
@@ -1477,7 +1553,7 @@
       $('ax-overlay-seg').style.display = 'inline-flex';
       axOverlaySet('off');
       $('html-code').textContent = prettySource || '(empty)';
-      $('toon-code').textContent = toon || '(no AX tree)';
+      $('toon-code').textContent = toon || '(no HTML)';
       renderAxTree($('axtree-view'), r.ax_tree);
       $('diagnostics-list').innerHTML =
         `<div class="item">Loaded /replicate-ui extraction from ${r.dir || '(unknown)'}</div>`;
@@ -1667,6 +1743,51 @@
       return lines.join('\n');
     }
 
+    // Build a compact TOON-style outline of the HTML DOM (the actual deliverable) —
+    // NOT the AX tree. Shape: `tag#id.class [attrs] "text" { children }`.
+    // This is the TOON *for the HTML*, which is what the TOON tab/export shows.
+    function htmlToToon(html) {
+      if (!html) return '(no HTML)';
+      let doc;
+      try { doc = new DOMParser().parseFromString(html, 'text/html'); }
+      catch (e) { return html; }
+      const root = doc.body || doc.documentElement;
+      const SKIP = new Set(['script', 'style', 'meta', 'link', 'title', 'head', 'base', 'noscript']);
+      const lines = [];
+      const emit = (el, d) => {
+        const tag = el.tagName.toLowerCase();
+        if (SKIP.has(tag)) return;
+        const pad = '  '.repeat(d);
+        const id = el.id ? `#${el.id}` : '';
+        const cls = el.classList.length ? '.' + [...el.classList].join('.') : '';
+        const attrs = [];
+        if (el.hasAttribute('role')) attrs.push(`role=${el.getAttribute('role')}`);
+        if (el.hasAttribute('type')) attrs.push(`type=${el.getAttribute('type')}`);
+        if (el.hasAttribute('href')) attrs.push(`href="${el.getAttribute('href')}"`);
+        if (el.hasAttribute('src')) attrs.push('src=…');
+        if (el.hasAttribute('placeholder')) attrs.push(`placeholder="${el.getAttribute('placeholder')}"`);
+        if (el.hasAttribute('aria-label')) attrs.push(`aria-label="${el.getAttribute('aria-label')}"`);
+        // direct text only (not descendants')
+        let txt = '';
+        for (const n of el.childNodes) if (n.nodeType === 3) txt += n.textContent;
+        txt = txt.replace(/\s+/g, ' ').trim();
+        const a = attrs.length ? ' ' + attrs.join(' ') : '';
+        const t = txt ? ` "${txt.slice(0, 64)}"` : '';
+        const label = tag + id + cls + a + t;
+        const kids = [...el.children].filter(c => !SKIP.has(c.tagName.toLowerCase()));
+        if (kids.length) {
+          lines.push(pad + label + ' {');
+          kids.forEach(k => emit(k, d + 1));
+          lines.push(pad + '}');
+        } else {
+          lines.push(pad + label);
+        }
+      };
+      [...root.children].forEach(c => emit(c, 0));
+      const out = lines.join('\n');
+      return out || '(no HTML)';
+    }
+
     // --- AX Tree rendering (pro tree view) ------------------------------------
     // r.ax_tree is pretty-printed JSON: either a single Node {role,name,value,
     // bounds,children,…} (one element) or an array of {element,role,name,ax_tree}
@@ -1821,7 +1942,10 @@
       iframe.srcdoc = r.html || '<!DOCTYPE html><body style="font-family:sans-serif;padding:24px;color:#666">No HTML output.</body>';
 
       $('html-code').textContent = r.html || '(empty)';
-      $('toon-code').textContent = r.toon || '(empty)';
+      // TOON tab = a compact outline of the HTML deliverable (not the AX tree).
+      const toon = htmlToToon(r.html);
+      lastResult.toon = toon;
+      $('toon-code').textContent = toon || '(empty)';
       renderAxTree($('axtree-view'), r.ax_tree);
 
       const diag = $('diagnostics-list');
@@ -1839,6 +1963,10 @@
       $('last-capture').textContent = r.strategy;
       $('status').textContent = 'Ready';
       $('status').classList.remove('active');
+      // Post-capture guidance in the Pick Mode card (persists until the next action).
+      $('pick-status-title').textContent = '✓ Captured — preview ready';
+      $('pick-status-sub').innerHTML =
+        'Inspect the tabs → · 💾 save (copies the file path) · or run <span class="key">/replicate-ui</span> in Claude Code for a pixel-verified replica.';
       toast(`Captured ${r.count} element${r.count === 1 ? '' : 's'} via ${r.strategy}`);
     }
 
@@ -1855,73 +1983,38 @@
     });
 
     // --- Save buttons --------------------------------------------------------
-    $('save-html').addEventListener('click', async () => {
-      if (!lastResult) return;
+    // Save to disk, then put the saved file's PATH on the clipboard so the user
+    // can immediately paste it (into Claude, a terminal, an editor…).
+    async function saveAndCopyPath(kind, name, contents) {
       try {
-        const path = await invoke('save_to_disk', { name: `vibe-extract-${Date.now()}.html`, contents: lastResult.html });
-        toast(`Saved: ${path}`);
+        const path = await invoke('save_to_disk', { name, contents });
+        try {
+          await navigator.clipboard.writeText(path);
+          toast(`Saved ${kind} — path copied to clipboard\n${path}`, { ms: 5000 });
+        } catch (_) {
+          toast(`Saved: ${path}`); // clipboard unavailable — still show where it went
+        }
       } catch (e) { toast(`Save failed: ${e}`, { warn: true, ms: 4500 }); }
-    });
-    $('save-toon').addEventListener('click', async () => {
+    }
+    $('save-html').addEventListener('click', () => {
       if (!lastResult) return;
-      try {
-        const path = await invoke('save_to_disk', { name: `vibe-extract-${Date.now()}.toon`, contents: lastResult.toon });
-        toast(`Saved: ${path}`);
-      } catch (e) { toast(`Save failed: ${e}`, { warn: true, ms: 4500 }); }
+      // Save the self-contained version so the file opens standalone (relative
+      // asset paths would break once the .html leaves its output folder).
+      saveAndCopyPath('HTML', `echo-${Date.now()}.html`, lastResult.htmlInline || lastResult.html);
     });
-    $('save-axtree').addEventListener('click', async () => {
+    $('save-toon').addEventListener('click', () => {
+      if (!lastResult) return;
+      saveAndCopyPath('TOON', `echo-${Date.now()}.toon`, lastResult.toon);
+    });
+    $('save-axtree').addEventListener('click', () => {
       if (!lastResult) return;
       if (!lastResult.ax_tree) { toast('No AX tree for this capture (try a native macOS app).', { warn: true, ms: 4500 }); return; }
-      try {
-        const path = await invoke('save_to_disk', { name: `vibe-extract-${Date.now()}.json`, contents: lastResult.ax_tree });
-        toast(`Saved: ${path}`);
-      } catch (e) { toast(`Save failed: ${e}`, { warn: true, ms: 4500 }); }
+      saveAndCopyPath('AX tree', `echo-${Date.now()}.json`, lastResult.ax_tree);
     });
 
-    // --- Electron-apps settings ---------------------------------------------
-    async function refreshElectronApps() {
-      const list = $('electron-apps-list');
-      if (!list) return;
-      try {
-        const [apps, settingsObj] = await Promise.all([
-          invoke('known_electron_apps'),
-          invoke('get_settings_cmd'),
-        ]);
-        const prefs = (settingsObj && settingsObj.electron_relaunch) || {};
-        list.innerHTML = '';
-        for (const app of apps) {
-          const current = prefs[app.bundle_id] || 'ask';
-          const row = document.createElement('div');
-          row.className = 'electron-app-row';
-          row.innerHTML = `
-            <span class="name">${escapeText(app.display_name)}</span>
-            <span class="electron-pref-segmented" data-bundle="${escapeText(app.bundle_id)}">
-              <button data-pref="ask" title="Ask each time">Ask</button>
-              <button data-pref="always_yes" title="Always restart in debug mode">Always</button>
-              <button data-pref="always_no" title="Never restart — always use AX path">Never</button>
-            </span>
-          `;
-          const seg = row.querySelector('.electron-pref-segmented');
-          for (const btn of seg.querySelectorAll('button')) {
-            if (btn.dataset.pref === current) btn.classList.add('on');
-            btn.addEventListener('click', async () => {
-              try {
-                await invoke('set_electron_pref_cmd', { bundleId: app.bundle_id, pref: btn.dataset.pref });
-                for (const b of seg.querySelectorAll('button')) b.classList.remove('on');
-                btn.classList.add('on');
-                toast(`${app.display_name}: ${btn.textContent.toLowerCase()}`);
-              } catch (e) {
-                toast(`Save failed: ${e}`, { warn: true });
-              }
-            });
-          }
-          list.appendChild(row);
-        }
-      } catch (e) {
-        list.innerHTML = `<div class="row"><span style="color: var(--error)">Settings unavailable</span></div>`;
-        console.warn('refreshElectronApps failed:', e);
-      }
-    }
+    // Electron-apps settings section removed — no hardcoded app list. Debug-mode
+    // relaunch is offered per-app on the fly via the ⌘⇧E prompt (which remembers
+    // your Always/Never choice), so no pre-populated list is needed.
 
     function escapeText(s) {
       return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -1946,7 +2039,6 @@
 
     refreshUI();
     refreshPermission();
-    refreshElectronApps();
     setInterval(refreshPermission, 5000);
 
     // Debug hook (also handy when driving the app from MCP / devtools).
@@ -1970,7 +2062,22 @@
         urlEl.textContent = show ? current.url : '—';
         urlRow.style.display = show ? '' : 'none';
         copyBtn.style.display = show ? '' : 'none';
+        // Surface a hard-to-miss warning when Claude can't connect.
+        const banner = document.getElementById('mcp-banner');
+        if (banner) banner.classList.toggle('show', !current.running);
       }
+
+      const bannerStart = document.getElementById('mcp-banner-start');
+      if (bannerStart) bannerStart.addEventListener('click', async () => {
+        if (current.running) return; // banner only shows when off, but double-guard
+        bannerStart.disabled = true;
+        try { render(await invoke('mcp_toggle')); }
+        catch (e) { toast(`MCP start failed: ${e}`, { warn: true }); }
+        finally { bannerStart.disabled = false; }
+      });
+
+      // Keep the status live (server can die or be started from elsewhere).
+      setInterval(() => invoke('mcp_status').then(render).catch(() => {}), 5000);
 
       toggleBtn.addEventListener('click', async () => {
         toggleBtn.disabled = true;
@@ -1981,7 +2088,7 @@
 
       copyBtn.addEventListener('click', async () => {
         if (!current.url) return;
-        const cmd = 'claude mcp add --transport http vibe-extract ' + current.url;
+        const cmd = 'claude mcp add --transport http echo ' + current.url;
         try {
           await navigator.clipboard.writeText(cmd);
           copyBtn.textContent = 'Copied!';

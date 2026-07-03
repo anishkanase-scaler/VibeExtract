@@ -11,7 +11,7 @@ poll `get_selection`, wait out a **10s debounce** (so multi-select finishes), th
 `replicate-ui` skill on the pick using its **pick-time `crop_path`** (valid even with the app
 closed), notify, and **stop** — this is ONE-SHOT.
 
-Requires the `vibe-extract` MCP server connected (the `get_selection` tool). If it isn't,
+Requires the `echo` MCP server connected (the `get_selection` tool). If it isn't,
 tell the user to start it and **omit** the wakeup (end the loop).
 
 State lives in `.replicate-ui/.watch-state.json` (in the cwd): `{ "baseline": <crop_path|null>,

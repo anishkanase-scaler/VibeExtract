@@ -3,15 +3,15 @@
 
 The app ships ONE folder — a local plugin *marketplace* — under
 `src-tauri/resources/plugin/`. On launch the app runs `claude plugin marketplace add`
-+ `claude plugin install replicate-ui@vibe-extract` so an end user who installs only
++ `claude plugin install replicate-ui@echo` so an end user who installs only
 the desktop app gets the `/replicate-ui` (+ `/replicate-ui-watch`) skills AND the
-vibe-extract MCP server, with no manual `~/.claude/skills` copying or `claude mcp add`.
+echo MCP server, with no manual `~/.claude/skills` copying or `claude mcp add`.
 
 Layout produced:
   resources/plugin/                          <- marketplace root
     .claude-plugin/marketplace.json
     replicate-ui/                            <- the plugin
-      .claude-plugin/plugin.json             <- bundles skills + MCP servers (vibe-extract on by default)
+      .claude-plugin/plugin.json             <- bundles skills + MCP servers (echo on by default)
       skills/replicate-ui/      (SKILL.md + _shared)
       skills/replicate-ui-watch/(SKILL.md)
 
@@ -26,7 +26,7 @@ RES = os.path.join(HERE, "src-tauri", "resources")
 SKILL_SRC = {"replicate-ui": os.path.join(RES, "replicate-ui"),
              "replicate-ui-watch": os.path.join(RES, "replicate-ui-watch")}
 PLUGIN_NAME = "replicate-ui"
-MARKETPLACE = "vibe-extract"
+MARKETPLACE = "echo"
 VERSION = "1.0.0"
 
 out_mkt = os.path.join(RES, "plugin")
@@ -49,17 +49,17 @@ for name, src in SKILL_SRC.items():
         sys.exit(f"ERROR: canonical skill missing: {src}/SKILL.md")
     shutil.copytree(src, os.path.join(out_skills, name), ignore=_ignore)
 
-# plugin manifest — bundles BOTH skills + the MCP servers (vibe-extract on by default)
+# plugin manifest — bundles BOTH skills + the MCP servers (echo on by default)
 plugin_json = {
     "name": PLUGIN_NAME,
     "description": "Replicate a running macOS app's UI as self-verified HTML+CSS via the "
                    "VibeExtract + Playwright MCP loop. Bundles the /replicate-ui and "
-                   "/replicate-ui-watch skills and the vibe-extract MCP server.",
+                   "/replicate-ui-watch skills and the echo MCP server.",
     "version": VERSION,
     "author": {"name": "VibeExtract"},
     "keywords": ["ui", "replicate", "macos", "screenshot", "accessibility", "mcp"],
     "mcpServers": {
-        "vibe-extract": {"type": "http", "url": "http://127.0.0.1:8765/mcp"},
+        "echo": {"type": "http", "url": "http://127.0.0.1:8765/mcp"},
         "playwright": {"command": "npx", "args": ["@playwright/mcp@latest", "--headless", "--isolated"]}
     }
 }
@@ -83,7 +83,7 @@ with open(os.path.join(out_mkt, ".claude-plugin", "marketplace.json"), "w") as f
 print(f"built plugin marketplace at {out_mkt}")
 print(f"  plugin: {PLUGIN_NAME}@{MARKETPLACE} v{VERSION}")
 print(f"  skills: {', '.join(SKILL_SRC)}")
-print(f"  mcp:    vibe-extract (http://127.0.0.1:8765/mcp), playwright")
+print(f"  mcp:    echo (http://127.0.0.1:8765/mcp), playwright")
 
 # Keep the repo-local dev copy (.claude/skills/<skill>) in sync with canonical,
 # so editing canonical + running this script updates ALL three copies — the

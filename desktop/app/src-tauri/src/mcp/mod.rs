@@ -1,6 +1,6 @@
-//! Embedded MCP server for VibeExtract.
+//! Embedded MCP server for Echo.
 //!
-//! Exposes VibeExtract's native inspection (AX tree, on-screen windows,
+//! Exposes Echo's native inspection (AX tree, on-screen windows,
 //! self-taken screenshots), the existing extraction ladder, and a visual diff
 //! verifier as MCP tools that Claude drives directly to replicate desktop UIs.
 //!
@@ -133,7 +133,7 @@ impl VibeExtractMcp {
     }
 
     #[tool(
-        description = "Open System Settings → Privacy → Accessibility so the user can grant VibeExtract access. Returns the current trusted state."
+        description = "Open System Settings → Privacy → Accessibility so the user can grant Echo access. Returns the current trusted state."
     )]
     async fn request_ax_permission(
         &self,
@@ -313,7 +313,7 @@ impl VibeExtractMcp {
     }
 
     #[tool(
-        description = "Run VibeExtract's full extraction ladder at a screen point: picks the element, then tries CDP (Electron) / native AX / screenshot. Returns a CaptureResult (strategy, fidelity, toon, html, screenshot). A high-fidelity head-start for the first HTML draft."
+        description = "Run Echo's full extraction ladder at a screen point: picks the element, then tries CDP (Electron) / native AX / screenshot. Returns a CaptureResult (strategy, fidelity, toon, html, screenshot). A high-fidelity head-start for the first HTML draft."
     )]
     async fn extract_component(
         &self,
@@ -524,7 +524,7 @@ impl VibeExtractMcp {
     }
 
     #[tool(
-        description = "Display a finished /replicate-ui extraction INSIDE the VibeExtract app's result panel (Preview + HTML + AX Tree tabs) — the in-app alternative to serving the replica at a localhost URL. `dir` is the extraction output folder (holds index.html, optional ax_tree.json, and icons/assets). Reads index.html and INLINES its local assets so the preview is self-contained, reads ax_tree.json if present, pushes both to the app window, and brings it to the front. Call this at the end of a /replicate-ui run instead of starting an http.server."
+        description = "Display a finished /replicate-ui extraction INSIDE the Echo app's result panel (Preview + HTML + AX Tree tabs) — the in-app alternative to serving the replica at a localhost URL. `dir` is the extraction output folder (holds index.html, optional ax_tree.json, and icons/assets). Reads index.html and INLINES its local assets so the preview is self-contained, reads ax_tree.json if present, pushes both to the app window, and brings it to the front. Call this at the end of a /replicate-ui run instead of starting an http.server."
     )]
     async fn show_replica(
         &self,
@@ -577,9 +577,9 @@ impl VibeExtractMcp {
 impl ServerHandler for VibeExtractMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("vibe-extract", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("echo", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "VibeExtract exposes a running Mac's native UI for automated replication. \
+                "Echo exposes a running Mac's native UI for automated replication. \
                  Typical loop: check_ax_permission → frontmost_app/list_windows → ax_tree \
                  (component inventory with bounds) → screenshot_region/screenshot_window \
                  (your own reference shots; note the returned `scale` for Retina) → write \
@@ -1033,7 +1033,7 @@ mod tests {
             "expected a 2xx status from /mcp, got:\n{resp}"
         );
         assert!(
-            resp.contains("\"result\"") && resp.contains("vibe-extract"),
+            resp.contains("\"result\"") && resp.contains("echo"),
             "expected an MCP initialize result naming the server, got:\n{resp}"
         );
     }

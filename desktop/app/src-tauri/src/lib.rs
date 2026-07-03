@@ -1,4 +1,4 @@
-//! VibeExtract Desktop — Tauri shell.
+//! Echo Desktop — Tauri shell.
 //!
 //! Matches the browser extension's UX exactly:
 //!   - Cmd+Shift+S — toggle pick mode (overlay window shows, hover-tracks at 30Hz)
@@ -200,7 +200,7 @@ fn dirs_home() -> PathBuf {
 }
 
 fn find_output_dir() -> PathBuf {
-    let dir = dirs_home().join("Documents").join("VibeExtract Captures");
+    let dir = dirs_home().join("Documents").join("Echo Captures");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -314,15 +314,15 @@ fn has_claude_cli() -> bool {
 fn install_plugin_via_cli(app: &AppHandle, vibe_url: &str, notes: &mut Vec<String>) -> Result<bool, String> {
     let src = bundled_plugin(app).ok_or("bundled plugin marketplace not found")?;
     // Stable writable copy (the .app Resources is read-only; the marketplace source path must persist).
-    let dest = dirs_home().join(".vibe-extract").join("plugin");
+    let dest = dirs_home().join(".echo").join("plugin");
     let _ = std::fs::remove_dir_all(&dest);
     copy_tree(&src, &dest).map_err(|e| format!("copy plugin failed: {e}"))?;
 
-    // Bake the live vibe-extract url into the installed plugin manifest (the MCP port can vary).
+    // Bake the live echo MCP url into the installed plugin manifest (the MCP port can vary).
     let manifest = dest.join("replicate-ui").join(".claude-plugin").join("plugin.json");
     if let Ok(txt) = std::fs::read_to_string(&manifest) {
         if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&txt) {
-            if let Some(srv) = v.pointer_mut("/mcpServers/vibe-extract/url") {
+            if let Some(srv) = v.pointer_mut("/mcpServers/echo/url") {
                 *srv = serde_json::Value::String(vibe_url.to_string());
             }
             if let Ok(body) = serde_json::to_string_pretty(&v) {
@@ -332,17 +332,21 @@ fn install_plugin_via_cli(app: &AppHandle, vibe_url: &str, notes: &mut Vec<Strin
     }
 
     let dest_s = dest.display().to_string();
-    // Idempotent: add (or refresh) the marketplace, then install (or update) the plugin.
+    // Idempotent: best-effort remove the pre-rename registrations (vibe-extract era),
+    // then add (or refresh) the marketplace and install (or update) the plugin.
     let cmd = format!(
-        "claude plugin marketplace add '{p}' --scope user 2>&1 || claude plugin marketplace update vibe-extract 2>&1; \
-         claude plugin install replicate-ui@vibe-extract --scope user 2>&1 || claude plugin update replicate-ui@vibe-extract 2>&1; \
+        "claude plugin uninstall replicate-ui@vibe-extract >/dev/null 2>&1; \
+         claude plugin marketplace remove vibe-extract >/dev/null 2>&1; \
+         claude mcp remove vibe-extract >/dev/null 2>&1; \
+         claude plugin marketplace add '{p}' --scope user 2>&1 || claude plugin marketplace update echo 2>&1; \
+         claude plugin install replicate-ui@echo --scope user 2>&1 || claude plugin update replicate-ui@echo 2>&1; \
          claude plugin list 2>&1",
         p = dest_s.replace('\'', "'\\''")
     );
     let (_ok, out) = login_shell_status(&cmd);
-    let installed = out.contains("replicate-ui@vibe-extract");
+    let installed = out.contains("replicate-ui@echo");
     if installed {
-        notes.push("installed /replicate-ui plugin (vibe-extract MCP bundled, on by default)".into());
+        notes.push("installed /replicate-ui plugin (echo MCP bundled, on by default)".into());
     } else {
         notes.push(format!("plugin install did not confirm; CLI said: {}", out.trim().chars().take(200).collect::<String>()));
     }
@@ -364,7 +368,7 @@ fn login_shell(cmd: &str) -> Vec<u8> {
 }
 
 /// Merge our MCP servers into ~/.claude.json (user scope) WITHOUT clobbering the
-/// user's other config/servers. vibe-extract -> the live url; playwright added only
+/// user's other config/servers. echo -> the live url; playwright added only
 /// if absent. Order-preserving + atomic + one-time backup. Returns true if changed.
 fn register_mcp_servers(vibe_url: &str) -> Result<bool, String> {
     use serde_json::{json, Value};
@@ -389,7 +393,9 @@ fn register_mcp_servers(vibe_url: &str) -> Result<bool, String> {
             *servers = json!({});
         }
         let s = servers.as_object_mut().unwrap();
-        s.insert("vibe-extract".to_string(), json!({"type": "http", "url": vibe_url}));
+        // Rebrand: the server registers as `echo` now; drop any stale pre-rename entry.
+        s.remove("vibe-extract");
+        s.insert("echo".to_string(), json!({"type": "http", "url": vibe_url}));
         s.entry("playwright").or_insert_with(|| {
             json!({"command": "npx", "args": ["@playwright/mcp@latest", "--headless", "--isolated"]})
         });
@@ -408,9 +414,9 @@ fn register_mcp_servers(vibe_url: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Install the bundled PLUGIN (skills + vibe-extract MCP) + best-effort deps. Idempotent.
+/// Install the bundled PLUGIN (skills + echo MCP) + best-effort deps. Idempotent.
 /// Primary path: `claude plugin marketplace add` + `install` so one app install gives the user
-/// `/replicate-ui` and the vibe-extract MCP with no manual setup. Fallback (no `claude` CLI):
+/// `/replicate-ui` and the echo MCP with no manual setup. Fallback (no `claude` CLI):
 /// the legacy loose-skill copy into ~/.claude/skills + MCP merge into ~/.claude.json.
 fn setup_claude_integration(app: &AppHandle, mcp_url: Option<String>) -> Result<SetupReport, String> {
     let mut notes: Vec<String> = Vec::new();
@@ -425,9 +431,9 @@ fn setup_claude_integration(app: &AppHandle, mcp_url: Option<String>) -> Result<
         match install_plugin_via_cli(app, &vibe_url, &mut notes) {
             Ok(true) => {
                 skill_installed = true;
-                mcp_registered = true; // the plugin bundles + auto-registers the vibe-extract MCP
+                mcp_registered = true; // the plugin bundles + auto-registers the echo MCP
                 skill_path =
-                    dirs_home().join(".vibe-extract").join("plugin").join("replicate-ui").display().to_string();
+                    dirs_home().join(".echo").join("plugin").join("replicate-ui").display().to_string();
                 // Remove the legacy loose skills so /replicate-ui isn't defined twice.
                 let sk = dirs_home().join(".claude").join("skills");
                 for n in ["replicate-ui", "replicate-ui-watch"] {
@@ -1045,7 +1051,21 @@ async fn commit_selection(app: AppHandle) -> Result<(), String> {
     };
     persist_and_broadcast(&app, &list); // ensure last-selection.json reflects the final pick
     teardown_pick_mode_ui(&app);
-    let _ = app.emit("selection-committed", list.len());
+    // Slim per-element payload (not just a count) — the UI shows the locked
+    // components (name/role/size + pick-time crop thumbnail) so the user sees
+    // WHAT locked. ax_tree is deliberately omitted (can be hundreds of KB).
+    let slim: Vec<serde_json::Value> = list
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "role": p.role,
+                "name": p.name,
+                "bounds": p.bounds,
+                "crop_path": p.crop_path,
+            })
+        })
+        .collect();
+    let _ = app.emit("selection-committed", slim);
     raise_main_window(&app);
     Ok(())
 }
@@ -1592,6 +1612,16 @@ async fn export_selection(app: AppHandle) -> Result<ExportPayload, String> {
     if selected.is_empty() {
         return Err("nothing selected".into());
     }
+    // The extractor needs the target LIVE: a SIGSTOP-frozen app can't answer AX or
+    // CDP — the debug-port probe times out and misreads as "needs relaunch", which
+    // popped a spurious restart dialog on ⌘⇧E even for apps already in debug mode.
+    // The pick-time crop already preserved the frozen pixels, so resume it now
+    // (the soft reset below keeps it resumed anyway).
+    {
+        let state = app.state::<PickSessionState>();
+        let mut s = state.0.lock().unwrap();
+        unfreeze_app(&mut s.freeze_pid);
+    }
     let out_dir = app.state::<OutputDir>().inner().0.clone();
 
     // Hide the overlay BEFORE running the extractor so its screenshot step
@@ -2078,25 +2108,157 @@ struct KnownAppLite {
 /// smaller region. Bound to ↑ / ↓ while pick mode is active.
 #[cfg(target_os = "macos")]
 async fn walk_hover_ancestry(app: AppHandle, go_up: bool) -> Result<(), String> {
-    // For an Electron target the hover is CDP-driven: ↑/↓ just adjust how many
-    // extra DOM-parent steps to widen by, and the hover task re-probes on the
-    // next tick (row → channel list → sidebar, each shown). The AX ancestry walk
-    // below is the native-app path.
-    {
+    // For an Electron target the hover is CDP-driven: ↑/↓ adjust how many extra
+    // DOM-parent steps to widen by, then RE-PROBE HERE and commit the result.
+    // (Deferring to the hover task's next tick doesn't work after a pick: the
+    // target is SIGSTOP-frozen, so that task bails at its frozen-app guard and
+    // the arrows visibly did nothing. A frozen app can't answer CDP either, so
+    // resume it around the probe, same lifecycle as the AX walk below.)
+    let cdp_ctx = {
         let state = app.state::<PickSessionState>();
         let mut s = state.0.lock().unwrap();
         if !s.active {
             return Err("pick mode not active".into());
         }
-        if s.cdp_port.is_some() {
-            s.widen_level = if go_up {
-                s.widen_level.saturating_add(1)
-            } else {
-                s.widen_level.saturating_sub(1)
-            };
-            log::info!("walk_hover_ancestry(electron): widen_level = {}", s.widen_level);
-            return Ok(());
+        match (s.cdp_port, s.target_win) {
+            (Some(port), Some(win)) => {
+                s.widen_level = if go_up {
+                    s.widen_level.saturating_add(1)
+                } else {
+                    s.widen_level.saturating_sub(1)
+                };
+                let anchor = s
+                    .selected
+                    .last()
+                    .or(s.last_hover.as_ref())
+                    .map(|p| p.click.unwrap_or_else(|| p.bounds.center()));
+                let frozen = unfreeze_app(&mut s.freeze_pid);
+                Some((port, win, s.widen_level, s.target_pid, anchor, frozen))
+            }
+            _ => None,
         }
+    };
+    if let Some((port, win, widen, tpid, anchor, frozen_pid)) = cdp_ctx {
+        let refreeze = |app: &AppHandle| {
+            if let Some(pid) = frozen_pid {
+                let st = app.state::<PickSessionState>();
+                let mut s = st.0.lock().unwrap();
+                if s.active {
+                    freeze_app(&mut s.freeze_pid, pid);
+                }
+            }
+        };
+        let Some(pt) = anchor else {
+            refreeze(&app);
+            return Err("no element to walk from".into());
+        };
+        let hit = match vibe_extract_core::cdp::probe_at(port, 0, pt.x - win.x, pt.y - win.y, widen)
+            .await
+        {
+            Ok(Some(hit)) => hit,
+            Ok(None) => {
+                refreeze(&app);
+                return Err("nothing at the anchor point (CDP)".into());
+            }
+            Err(e) => {
+                refreeze(&app);
+                return Err(format!("CDP probe failed: {e}"));
+            }
+        };
+        let bounds = vibe_extract_core::capture::ScreenRect {
+            x: hit.x + win.x,
+            y: hit.y + win.y,
+            w: hit.w,
+            h: hit.h,
+        };
+        let label = if hit.label.is_empty() { hit.tag.clone() } else { hit.label.clone() };
+        let role = if hit.role.is_empty() { format!("dom:{}", hit.tag) } else { hit.role.clone() };
+        let picked = PickedElement {
+            role: role.clone(),
+            subrole: None,
+            name: label.clone(),
+            identifier: None,
+            bounds,
+            pid: tpid.unwrap_or(-1),
+            app_path: tpid.and_then(vibe_extract_core::ax_macos::pid_to_path),
+            window_title: None,
+            window_bounds: Some(win),
+            click: Some(pt),
+            ax_shallow: false,
+            crop_path: None,
+            ax_tree: None,
+        };
+        let cursor = vibe_extract_core::ax_macos::current_cursor();
+        // INSTANT commit + re-freeze, mirroring the AX path below: selection and
+        // highlight move now; the pixel crop back-fills in the background.
+        let list = {
+            let state = app.state::<PickSessionState>();
+            let mut s = state.0.lock().unwrap();
+            if !s.active {
+                return Err("pick mode not active".into());
+            }
+            if let Some(pid) = frozen_pid {
+                freeze_app(&mut s.freeze_pid, pid);
+            }
+            s.selected.clear();
+            s.selected.push(picked.clone());
+            s.locked_pid = Some(picked.pid);
+            s.last_hover = Some(picked.clone());
+            s.nav_active = true;
+            s.nav_anchor_cursor = Some(cursor);
+            s.selected.clone()
+        };
+        persist_and_broadcast(&app, &list);
+        if let Some(overlay) = app.get_webview_window("overlay") {
+            let _ = overlay.emit(
+                "overlay-hover",
+                OverlayHoverPayload {
+                    bounds: Some(OverlayBounds {
+                        x: bounds.x,
+                        y: bounds.y,
+                        w: bounds.w,
+                        h: bounds.h,
+                    }),
+                    role,
+                    name: label,
+                    cursor: OverlayCursor { x: cursor.x, y: cursor.y },
+                },
+            );
+        }
+        log::info!(
+            "walk_hover_ancestry(electron, {}): widen_level={} → {} \"{}\" {:.0}x{:.0}",
+            if go_up { "up" } else { "down" },
+            widen, picked.role, picked.name, bounds.w, bounds.h
+        );
+        let app_bg = app.clone();
+        let mut picked_for_crop = picked.clone();
+        tauri::async_runtime::spawn(async move {
+            capture_pick_crop(&app_bg, &mut picked_for_crop).await;
+            let Some(cp) = picked_for_crop.crop_path.clone() else {
+                return;
+            };
+            let list = {
+                let state = app_bg.state::<PickSessionState>();
+                let mut s = state.0.lock().unwrap();
+                match s.selected.last_mut() {
+                    Some(last)
+                        if last.pid == picked_for_crop.pid
+                            && rects_match(&last.bounds, &picked_for_crop.bounds) =>
+                    {
+                        last.crop_path = Some(cp);
+                        Some(s.selected.clone())
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(list) = list {
+                let dir = app_bg.state::<OutputDir>().inner().0.clone();
+                if let Ok(js) = serde_json::to_string(&list) {
+                    let _ = std::fs::write(dir.join("last-selection.json"), js);
+                }
+            }
+        });
+        return Ok(());
     }
     // Snapshot the anchor (prefer the committed selection so ↑/↓ work AFTER a
     // pick; else the live hover) + the nav stack, without holding the lock across
@@ -2473,10 +2635,16 @@ async fn walk_hover_ancestry(_app: AppHandle, _go_up: bool) -> Result<(), String
     Err("walk_hover_ancestry only implemented on macOS".into())
 }
 
+/// Build version, shown in the UI header so it's obvious which build is running.
+#[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 #[tauri::command]
 async fn save_to_disk(name: String, contents: String) -> Result<String, String> {
     use std::io::Write;
-    let dir = dirs_home().join("Documents").join("VibeExtract Captures");
+    let dir = dirs_home().join("Documents").join("Echo Captures");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(&name);
     let mut f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
@@ -3078,7 +3246,11 @@ pub fn run() {
                             // ancestor (Up) or the deeper child (Down).
                             let go_up = combo.contains("ArrowUp");
                             if let Err(e) = walk_hover_ancestry(app.clone(), go_up).await {
-                                log::debug!("walk_hover_ancestry: {}", e);
+                                // Surface WHY the walk didn't move (top of tree, AX
+                                // re-acquire miss, …) — a silent no-op reads as a
+                                // dead key.
+                                log::info!("walk_hover_ancestry: {}", e);
+                                let _ = app.emit("toast", format!("{} {}", if go_up { "↑" } else { "↓" }, e));
                             }
                         }
                     });
@@ -3098,6 +3270,7 @@ pub fn run() {
         .manage(ExportInProgressState::default())
         .manage(mcp::McpServerState::default())
         .invoke_handler(tauri::generate_handler![
+            app_version,
             check_ax_permission,
             request_ax_permission,
             start_pick_mode,

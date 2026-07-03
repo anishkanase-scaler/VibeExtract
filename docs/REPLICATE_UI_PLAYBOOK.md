@@ -8,7 +8,7 @@ closed perceive → generate → render → verify loop.
 ```
                  ┌──────────────────── Claude (the agent) ────────────────────┐
                  │                                                             │
-   vibe-extract  │  check_ax_permission ─ frontmost_app/list_windows           │
+   echo  │  check_ax_permission ─ frontmost_app/list_windows           │
    (embedded in  │       │                                                     │
     the Tauri    │       ▼                                                     │
     app, HTTP)   │  ax_tree ──► component inventory (roles + bounds + values)  │
@@ -23,7 +23,7 @@ closed perceive → generate → render → verify loop.
    (npx)         │  browser_resize → browser_navigate(file://) →               │
                  │  browser_take_screenshot ──► replica PNG (path)             │
                  │       │                                                     │
-   vibe-extract  │       ▼                                                     │
+   echo  │       ▼                                                     │
                  │  compare_images(native_path, replica_path) ──► score + diff │
                  │       │                                                     │
                  │       └─ score < 0.92 ? fix CSS, re-render, re-diff ◄───────┘
@@ -35,7 +35,7 @@ The agent loop is defined in the **`replicate-ui`** skill
 
 ## Architecture
 
-- **`vibe-extract` MCP server** — embedded in the VibeExtract Tauri app
+- **`echo` MCP server** — embedded in the VibeExtract Tauri app
   (`desktop/app/src-tauri/src/mcp/`). rmcp Streamable-HTTP on `127.0.0.1:<port>`
   (default 8765), nested at `/mcp`, lifecycle tied to the app (Start/Stop from the
   app UI). Thin wrapper over `vibe-extract-core`; AX work runs in `spawn_blocking`
@@ -57,7 +57,7 @@ The agent loop is defined in the **`replicate-ui`** skill
   loses nothing but caching speed.** The per-app folders in *this* repo (`excel/`, `acrobat/`,
   `slack/`, …) are **local dev examples** of that scratch — not shipped, not required, not the model.
 
-## Tool reference (`vibe-extract`)
+## Tool reference (`echo`)
 
 | Tool | Params | Returns |
 |---|---|---|
@@ -368,13 +368,13 @@ reports "first page, full cost" and populates the cache as it goes.
 4. **Register both servers** with Claude Code — either paste `.mcp.json` (adjust
    the port to match the live URL and set `--output-dir` to an absolute path), or:
    ```
-   claude mcp add --transport http vibe-extract http://127.0.0.1:8765/mcp
+   claude mcp add --transport http echo http://127.0.0.1:8765/mcp
    ```
 5. **Install Playwright's browser** once (avoids a hang on first run):
    ```
    npx playwright install chromium
    ```
-6. **Verify:** `claude mcp list` shows both `vibe-extract` and `playwright`
+6. **Verify:** `claude mcp list` shows both `echo` and `playwright`
    connected. Then run `/replicate-ui`.
 
 ## Loop policy (defaults)
@@ -387,7 +387,7 @@ reports "first page, full cost" and populates the cache as it goes.
 
 ## Troubleshooting
 
-- **`vibe-extract` won't connect** — the app isn't running, or the server is
+- **`echo` won't connect** — the app isn't running, or the server is
   stopped. Open the app, click *Start MCP server*, confirm the URL matches your
   `claude mcp add` / `.mcp.json`. The port may differ from 8765 if it was busy —
   the app UI shows the live one.

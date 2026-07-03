@@ -12,9 +12,9 @@ Target / options (optional): $ARGUMENTS
   the VibeExtract captures dir).
 - A pass threshold override (default 0.92).
 
-Before starting, verify both MCP servers are connected (`vibe-extract` and
-`playwright`). If `vibe-extract` is absent, instruct the user to open the
-VibeExtract app → **Start MCP server** → copy the `claude mcp add` command.
+Before starting, verify both MCP servers are connected (`echo` and
+`playwright`). If `echo` is absent, instruct the user to open the
+Echo app → **Start MCP server** → copy the `claude mcp add` command.
 
 Then follow the skill's loop exactly, reporting the final visual-match score per
 component and for the composed window.

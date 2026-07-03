@@ -1,6 +1,6 @@
 [package]
 name = "vibe-extract-desktop"
-version = "0.2.0"
+version = "0.2.3"
 edition = "2021"
 description = "VibeExtract Desktop — Tauri shell. Wraps the core extraction library with a global hotkey, a small picker UI, and an export view that reuses the browser extension's export.html verbatim."
 

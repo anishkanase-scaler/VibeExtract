@@ -1,18 +1,18 @@
 ---
 name: replicate-ui
-description: Automatically replicate a running macOS app's UI as plain HTML+CSS, using VibeExtract's MCP tools (AX tree, self-screenshots, visual diff) plus the Playwright MCP to render and self-verify until the replica visually matches. Use when the user wants to clone/recreate a desktop app screen or window as web UI.
+description: Automatically replicate a running macOS app's UI as plain HTML+CSS, using Echo's MCP tools (AX tree, self-screenshots, visual diff) plus the Playwright MCP to render and self-verify until the replica visually matches. Use when the user wants to clone/recreate a desktop app screen or window as web UI.
 ---
 
 # Replicate a desktop UI (perceive → generate → verify loop)
 
-You drive a closed loop: inspect a running macOS app via the **`vibe-extract`** MCP
+You drive a closed loop: inspect a running macOS app via the **`echo`** MCP
 server, generate plain self-contained **HTML+CSS**, render it with the
 **`playwright`** MCP, and visually diff the render against the native original —
 iterating until they match.
 
-Both MCP servers must be connected (`claude mcp list`). If `vibe-extract` is
-missing, tell the user to open the VibeExtract app and click **Start MCP server**,
-then `claude mcp add --transport http vibe-extract <url>`. See
+Both MCP servers must be connected (`claude mcp list`). If `echo` is
+missing, tell the user to open the Echo app and click **Start MCP server**,
+then `claude mcp add --transport http echo <url>`. See
 `docs/REPLICATE_UI_PLAYBOOK.md` for full setup.
 
 ## The toolkit & where things live (read once)
@@ -548,7 +548,7 @@ Everything after this section is the detailed loop that implements these four pi
 
     **Show it IN THE APP, not at a URL.** Call the `show_replica { dir: "<abs path to
     .replicate-ui/<app>/" }` MCP tool — it loads `index.html` (assets auto-inlined) +
-    `ax_tree.json` into the VibeExtract app's result panel (Preview / HTML / AX Tree
+    `ax_tree.json` into the Echo app's result panel (Preview / HTML / AX Tree
     tabs) and brings the window forward. This is the user-facing preview; do NOT spin up
     `python3 -m http.server` or hand the user a `localhost` URL. (Playwright + a local
     file/server are still fine as YOUR private render target for the `compare_images`
@@ -581,7 +581,7 @@ Everything after this section is the detailed loop that implements these four pi
     bar is that the dev never has to point out a layout, icon, chevron, or colour mistake — catch them
     yourself in the stacked view first.
 
-## vibe-extract tools (reference)
+## echo tools (reference)
 `check_ax_permission`, `request_ax_permission`, `frontmost_app`, `list_windows`,
 `ax_tree`, `ax_node_at_point`, `ax_subtree_at_point`, `screenshot_region`,
 `screenshot_window`, `sample_color`, `color_palette`, `relaunch_with_debug_port`
